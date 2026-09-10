@@ -68,7 +68,9 @@ export function downloadFile(
       } else {
         blob = new Blob([data], { type: mimeType });
       }
-    } else if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+    } else if (data instanceof Uint8Array) {
+      blob = new Blob([new Uint8Array(data)], { type: mimeType });
+    } else if (data instanceof ArrayBuffer) {
       blob = new Blob([data], { type: mimeType });
     } else if (typeof data === "string") {
       // Handle data URL or raw text
