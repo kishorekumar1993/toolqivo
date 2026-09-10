@@ -83,15 +83,15 @@ export function ToolCard({ tool }: ToolCardProps) {
   return (
     <Link
       href={tool.route}
-      className={`group relative flex flex-col justify-between p-5 sm:p-6 rounded-2xl sm:rounded-3xl bg-white dark:bg-slate-900 border border-slate-200/90 dark:border-slate-800/90 shadow-xs hover:shadow-xl hover:-translate-y-1.5 transition-all duration-300 ${config.hoverBorder}`}
+      className={`group relative flex flex-col justify-between p-3.5 sm:p-5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/90 dark:border-slate-800/90 shadow-xs hover:shadow-xl hover:-translate-y-1.5 transition-all duration-300 ${config.hoverBorder}`}
     >
       <div>
         {/* Top Header Row */}
         <div className="flex items-start justify-between gap-2 mb-4">
           <div
-            className={`w-11 h-11 rounded-2xl ${config.iconBg} flex items-center justify-center shadow-xs group-hover:scale-108 transition-transform duration-300`}
+            className={`w-9 h-9 sm:w-11 sm:h-11 rounded-xl sm:rounded-2xl ${config.iconBg} flex items-center justify-center shadow-xs group-hover:scale-105 transition-transform duration-300`}
           >
-            <DynamicIcon name={tool.iconName} className="w-5 h-5" />
+            <DynamicIcon name={tool.iconName} className="w-4 h-4 sm:w-5 sm:h-5" />
           </div>
 
           <div className="flex items-center gap-1.5">
@@ -114,25 +114,25 @@ export function ToolCard({ tool }: ToolCardProps) {
         </div>
 
         {/* Title */}
-        <h3 className="text-base sm:text-lg font-black text-slate-900 dark:text-white tracking-tight group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+        <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white tracking-tight group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors leading-snug">
           {tool.name}
         </h3>
 
         {/* Description */}
-        <p className="mt-2 text-xs sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed line-clamp-2">
+        <p className="mt-1.5 text-[11px] sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed line-clamp-2">
           {tool.description}
         </p>
       </div>
 
-      {/* Modern Bottom Action Pill Button */}
-      <div className="mt-6 pt-3 border-t border-slate-100 dark:border-slate-800/80 flex items-center justify-between">
-        <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 dark:text-slate-500">
+      {/* Bottom Action Row */}
+      <div className="mt-4 sm:mt-6 pt-3 border-t border-slate-100 dark:border-slate-800/80 flex items-center justify-between">
+        <div className="hidden sm:flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 dark:text-slate-500">
           <Zap className="w-3 h-3 text-amber-500" />
-          <span>Instant & Free</span>
+          <span>Instant &amp; Free</span>
         </div>
 
         <span
-          className={`inline-flex items-center gap-1 px-3 py-1 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700/80 text-xs font-bold text-slate-700 dark:text-slate-200 shadow-2xs transition-all duration-200 ${config.btnHover}`}
+          className={`inline-flex items-center gap-1 px-2.5 sm:px-3 py-1 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700/80 text-xs font-bold text-slate-700 dark:text-slate-200 shadow-2xs transition-all duration-200 ${config.btnHover}`}
         >
           <span>Use Tool</span>
           <ArrowUpRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />

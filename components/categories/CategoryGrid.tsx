@@ -31,13 +31,13 @@ export function CategoryGrid() {
           </Link>
         </div>
 
-        {/* 8 Category Cards Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6">
+        {/* 8 Category Cards Grid — 2 col on mobile, 4 on desktop */}
+        <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-5">
           {CATEGORIES.map((cat) => (
             <Link
               key={cat.id}
               href={cat.route}
-              className="group flex flex-col justify-between p-5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-xs hover:shadow-hover hover:-translate-y-1 transition-all duration-200"
+              className="group flex flex-col justify-between p-4 sm:p-5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-xs hover:shadow-lg hover:-translate-y-1 transition-all duration-200"
             >
               <div>
                 <div className="flex items-center justify-between mb-4">

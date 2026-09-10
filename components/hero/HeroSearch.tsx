@@ -263,20 +263,18 @@ export function HeroSearch({ autoFocus = false }: HeroSearchProps) {
         </div>
       )}
 
-      {/* Popular Chips Row */}
-      <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs">
-        <span className="text-slate-500 dark:text-slate-400 font-medium mr-1">Popular:</span>
-        <div className="flex flex-wrap items-center justify-center gap-1.5">
-          {popularChips.map((chip) => (
-            <Link
-              key={chip.label}
-              href={chip.href}
-              className="inline-flex items-center px-3 py-1.5 rounded-full bg-slate-100 dark:bg-slate-800/80 hover:bg-blue-50 dark:hover:bg-blue-950/60 hover:text-blue-600 dark:hover:text-blue-400 text-slate-600 dark:text-slate-300 font-medium transition-colors border border-slate-200/70 dark:border-slate-700/60"
-            >
-              {chip.label}
-            </Link>
-          ))}
-        </div>
+      {/* Popular Chips Row — horizontally scrollable on mobile */}
+      <div className="mt-4 flex items-center gap-2 text-xs overflow-x-auto scrollbar-none pb-1 sm:flex-wrap sm:justify-center sm:overflow-visible">
+        <span className="text-slate-500 dark:text-slate-400 font-medium shrink-0">Popular:</span>
+        {popularChips.map((chip) => (
+          <Link
+            key={chip.label}
+            href={chip.href}
+            className="shrink-0 inline-flex items-center px-3 py-1.5 rounded-full bg-slate-100 dark:bg-slate-800/80 hover:bg-blue-50 dark:hover:bg-blue-950/60 hover:text-blue-600 dark:hover:text-blue-400 text-slate-600 dark:text-slate-300 font-medium transition-colors border border-slate-200/70 dark:border-slate-700/60"
+          >
+            {chip.label}
+          </Link>
+        ))}
       </div>
     </div>
   );
