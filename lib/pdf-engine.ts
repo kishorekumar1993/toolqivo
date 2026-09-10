@@ -628,15 +628,15 @@ export function sanitizeTextForPdf(input: string): string {
 
   // 1. Common icon & symbol transliterations (Tel, Mail, Web, Address, Checkmarks, Bullets)
   text = text
-    .replace(/[\u{1F4DE}\u{260E}\u{2706}\u{1F4F1}\u{1F4F2}]/gu, "Tel: ")
-    .replace(/[\u{2709}\u{1F4E7}\u{1F4E8}\u{1F4E9}\u{1F4EC}\u{1F4ED}]/gu, "Email: ")
-    .replace(/[\u{1F310}\u{1F517}\u{1F30D}\u{1F30E}\u{1F30F}]/gu, "Web: ")
-    .replace(/[\u{1F4CD}\u{1F4CC}\u{1F3E0}\u{1F3E2}]/gu, "Address: ")
-    .replace(/[\u{2022}\u{25AA}\u{25AB}\u{25B6}\u{25C6}\u{25C7}\u{25CB}\u{25CF}]/gu, "* ")
-    .replace(/[\u{2713}\u{2714}\u{2611}]/gu, "[x] ")
-    .replace(/[\u{2717}\u{2718}\u{2612}]/gu, "[ ] ")
-    .replace(/[\u{2605}\u{2606}\u{2B50}]/gu, "*")
-    .replace(/[\u{2190}\u{2192}\u{2194}\u{21D2}]/gu, "->");
+    .replace(new RegExp("[\\u{1F4DE}\\u{260E}\\u{2706}\\u{1F4F1}\\u{1F4F2}]", "gu"), "Tel: ")
+    .replace(new RegExp("[\\u{2709}\\u{1F4E7}\\u{1F4E8}\\u{1F4E9}\\u{1F4EC}\\u{1F4ED}]", "gu"), "Email: ")
+    .replace(new RegExp("[\\u{1F310}\\u{1F517}\\u{1F30D}\\u{1F30E}\\u{1F30F}]", "gu"), "Web: ")
+    .replace(new RegExp("[\\u{1F4CD}\\u{1F4CC}\\u{1F3E0}\\u{1F3E2}]", "gu"), "Address: ")
+    .replace(new RegExp("[\\u{2022}\\u{25AA}\\u{25AB}\\u{25B6}\\u{25C6}\\u{25C7}\\u{25CB}\\u{25CF}]", "gu"), "* ")
+    .replace(new RegExp("[\\u{2713}\\u{2714}\\u{2611}]", "gu"), "[x] ")
+    .replace(new RegExp("[\\u{2717}\\u{2718}\\u{2612}]", "gu"), "[ ] ")
+    .replace(new RegExp("[\\u{2605}\\u{2606}\\u{2B50}]", "gu"), "*")
+    .replace(new RegExp("[\\u{2190}\\u{2192}\\u{2194}\\u{21D2}]", "gu"), "->");
 
   // 2. Smart quotes, dashes and non-standard whitespace
   text = text
