@@ -285,7 +285,7 @@ function generateRealDocxBlob(title: string, textContent: string): Blob {
   ];
 
   const zipBytes = buildZip(entries);
-  return new Blob([zipBytes], {
+  return new Blob([new Uint8Array(zipBytes)], {
     type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   });
 }
@@ -632,7 +632,7 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
                 }))
               );
               const zipBytes = buildZip(zipEntries);
-              const zipBlob = new Blob([zipBytes], { type: "application/zip" });
+              const zipBlob = new Blob([new Uint8Array(zipBytes)], { type: "application/zip" });
               setAltDocBlob(zipBlob);
             } catch (zErr) {
               console.warn("ZIP creation fallback:", zErr);
@@ -682,7 +682,7 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
                 }))
               );
               const zipBytes = buildZip(zipEntries);
-              const zipBlob = new Blob([zipBytes], { type: "application/zip" });
+              const zipBlob = new Blob([new Uint8Array(zipBytes)], { type: "application/zip" });
               setAltDocBlob(zipBlob);
             } catch (zErr) {
               console.warn("ZIP creation fallback:", zErr);
