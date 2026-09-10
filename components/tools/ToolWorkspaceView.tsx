@@ -2,11 +2,12 @@
 
 import React, { useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, ShieldCheck, Zap, Sparkles, Share2, Check } from "lucide-react";
+import { ShieldCheck, Zap, Sparkles, Share2, Check } from "lucide-react";
 import { Tool } from "@/data/types";
 import { DynamicIcon } from "@/components/ui/DynamicIcon";
 import { TOOLS } from "@/data/tools";
 import { ToolCard } from "@/components/popular/ToolCard";
+import { Breadcrumb } from "@/components/seo/Breadcrumb";
 
 // Dedicated Workspace Engines
 import { ImageWorkspace } from "./workspaces/ImageWorkspace";
@@ -35,6 +36,25 @@ export function ToolWorkspaceView({ tool }: ToolWorkspaceViewProps) {
   const relatedTools = TOOLS.filter(
     (t) => t.category === tool.category && t.id !== tool.id
   ).slice(0, 4);
+
+  // Map category to its hub route
+  const categoryRouteMap: Record<string, string> = {
+    pdf: "/pdf-tools",
+    image: "/image-tools",
+    finance: "/finance",
+    calculators: "/calculators",
+    converters: "/converters",
+    country: "/country",
+    utility: "/utility-tools",
+    ai: "/ai-tools",
+  };
+  const categoryRoute = categoryRouteMap[tool.category] ?? "/tools";
+  const categoryLabel =
+    tool.category === "pdf" ? "PDF Tools"
+    : tool.category === "image" ? "Image Tools"
+    : tool.category === "ai" ? "AI Tools"
+    : tool.category === "utility" ? "Utility Tools"
+    : tool.category.charAt(0).toUpperCase() + tool.category.slice(1);
 
   const renderActiveWorkspace = () => {
     switch (tool.category) {
@@ -78,34 +98,24 @@ export function ToolWorkspaceView({ tool }: ToolWorkspaceViewProps) {
   return (
     <div className="py-8 sm:py-12 bg-slate-50/60 dark:bg-slate-950 min-h-screen">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
-        {/* Navigation / Breadcrumb Row */}
+        {/* Breadcrumb */}
         <div className="flex items-center justify-between gap-4 mb-6">
-          <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-            <Link href="/" className="hover:text-blue-600 font-medium">Home</Link>
-            <span>/</span>
-            <Link href={`/${tool.category}-tools`} className="hover:text-blue-600 capitalize font-medium">
-              {tool.category} Tools
-            </Link>
-            <span>/</span>
-            <span className="text-slate-900 dark:text-white font-semibold">{tool.name}</span>
-          </div>
+          <Breadcrumb
+            items={[
+              { label: categoryLabel, href: categoryRoute },
+              { label: tool.name },
+            ]}
+          />
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={copyToolLink}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-50 shadow-2xs transition-colors"
             >
               {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Share2 className="w-3.5 h-3.5" />}
-              <span>{copiedLink ? "Link Copied!" : "Share"}</span>
+              <span className="hidden sm:inline">{copiedLink ? "Copied!" : "Share"}</span>
             </button>
-            <Link
-              href="/tools"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:text-blue-600 shadow-2xs transition-colors"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              <span>All tools</span>
-            </Link>
           </div>
         </div>
 
@@ -160,7 +170,7 @@ export function ToolWorkspaceView({ tool }: ToolWorkspaceViewProps) {
                 View all {tool.category} tools →
               </Link>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
               {relatedTools.map((relTool) => (
                 <ToolCard key={relTool.id} tool={relTool} />
               ))}

@@ -2,10 +2,11 @@
 
 import React, { useState, useMemo } from "react";
 import Link from "next/link";
-import { ArrowLeft, ArrowRight, ShieldCheck, Sparkles, Zap, Search, SlidersHorizontal } from "lucide-react";
+import { ShieldCheck, Sparkles, Zap, Search } from "lucide-react";
 import { ToolCategory, Tool } from "@/data/types";
 import { ToolCard } from "@/components/popular/ToolCard";
 import { DynamicIcon } from "@/components/ui/DynamicIcon";
+import { Breadcrumb } from "@/components/seo/Breadcrumb";
 
 interface CategoryHubViewProps {
   category: ToolCategory;
@@ -35,14 +36,12 @@ export function CategoryHubView({ category, tools }: CategoryHubViewProps) {
   return (
     <div className="py-10 sm:py-16 bg-slate-50/60 dark:bg-slate-950 min-h-screen">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 mb-6">
-          <Link href="/" className="hover:text-blue-600 font-medium">Home</Link>
-          <span>/</span>
-          <Link href="/tools" className="hover:text-blue-600 font-medium">All Tools</Link>
-          <span>/</span>
-          <span className="text-slate-900 dark:text-white font-semibold">{category.name}</span>
-        </div>
+        <Breadcrumb
+          items={[
+            { label: "All Tools", href: "/tools" },
+            { label: category.name },
+          ]}
+        />
 
         {/* Hero Banner for Category */}
         <div className="relative overflow-hidden rounded-3xl bg-white dark:bg-slate-900 p-6 sm:p-10 border border-slate-200/80 dark:border-slate-800 shadow-sm mb-10">
@@ -136,7 +135,7 @@ export function CategoryHubView({ category, tools }: CategoryHubViewProps) {
           </div>
 
           {filteredTools.length > 0 ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-6">
+            <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-5">
               {filteredTools.map((tool) => (
                 <ToolCard key={tool.id} tool={tool} />
               ))}
