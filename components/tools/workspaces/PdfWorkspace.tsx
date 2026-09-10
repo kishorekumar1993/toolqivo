@@ -69,12 +69,7 @@ interface UploadedPdfItem {
   arrayBuffer?: ArrayBuffer;
 }
 
-interface RenderedJpgPage {
-  pageNum: number;
-  blob: Blob;
-  dataUrl: string;
-  fileName: string;
-}
+
 
 // ==========================================
 // 100% Genuine OpenXML PKZip .DOCX Generator
