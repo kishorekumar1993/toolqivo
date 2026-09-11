@@ -25,10 +25,35 @@ export interface DocxTextRun {
   highlight?: string; // hex or color name e.g. "FFFF00" or "yellow"
 }
 
+export interface DocxBorderSpec {
+  val?: "single" | "double" | "dashed" | "dotted" | "none";
+  sz?: number; // eighths of a point (e.g. 4 = 0.5pt, 8 = 1pt, 12 = 1.5pt)
+  space?: number; // in pt
+  color?: string; // hex
+}
+
+export interface DocxParagraphBorders {
+  top?: DocxBorderSpec;
+  bottom?: DocxBorderSpec;
+  left?: DocxBorderSpec;
+  right?: DocxBorderSpec;
+}
+
+export interface DocxFrameSpec {
+  x: number; // in pt (from page/margin left)
+  y: number; // in pt (from page/margin top)
+  width?: number; // in pt
+  height?: number; // in pt
+  hAnchor?: "page" | "margin" | "column";
+  vAnchor?: "page" | "margin" | "paragraph";
+  wrap?: "none" | "around" | "tight";
+}
+
 export interface DocxParagraphBlock {
   type: "paragraph";
   runs: DocxTextRun[];
   alignment?: "left" | "center" | "right" | "justify";
+  frame?: DocxFrameSpec;
   tabs?: { val: "left" | "center" | "right"; pos: number }[];
   isHeading?: boolean;
   headingLevel?: number; // 1, 2, 3...
@@ -42,6 +67,8 @@ export interface DocxParagraphBlock {
   firstLineIndent?: number; // in pt
   hangingIndent?: number; // in pt
   pageBreakBefore?: boolean;
+  borders?: DocxParagraphBorders;
+  bgColor?: string; // hex e.g. "F1F5F9"
 }
 
 export interface DocxTableCell {
@@ -62,6 +89,7 @@ export interface DocxTableBlock {
   rows: DocxTableRow[];
   colWidths?: number[]; // in pt
   hasHeader?: boolean;
+  borderStyle?: "grid" | "none";
 }
 
 export interface DocxImageBlock {
@@ -1338,8 +1366,6 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
   // 1. pStyle
   if (block.isHeading) {
     pPrElements.push(`<w:pStyle w:val="Heading${block.headingLevel || 1}"/>`);
-  } else if (block.isListItem) {
-    pPrElements.push(`<w:pStyle w:val="ListBullet"/>`);
   }
 
   // 2. pageBreakBefore
@@ -1347,13 +1373,56 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
     pPrElements.push("<w:pageBreakBefore/>");
   }
 
-  // 3. jc (alignment)
+  // 2b. framePr (Absolute spatial positioning / text frame)
+  if (block.frame) {
+    const f = block.frame;
+    const fParts: string[] = [];
+    if (f.width && f.width > 0) fParts.push(`w:w="${Math.round(f.width * 20)}"`);
+    if (f.height && f.height > 0) fParts.push(`w:h="${Math.round(f.height * 20)}" w:hRule="atLeast"`);
+    fParts.push(`w:x="${Math.round(f.x * 20)}"`);
+    fParts.push(`w:y="${Math.round(f.y * 20)}"`);
+    fParts.push(`w:hAnchor="${f.hAnchor || 'page'}"`);
+    fParts.push(`w:vAnchor="${f.vAnchor || 'page'}"`);
+    fParts.push(`w:wrap="${f.wrap || 'none'}"`);
+    pPrElements.push(`<w:framePr ${fParts.join(" ")}/>`);
+  }
+
+  // 3. pBdr (borders - e.g. section subheading divider lines, callout left border)
+  if (block.borders) {
+    const bdrParts: string[] = [];
+    if (block.borders.top) {
+      const b = block.borders.top;
+      bdrParts.push(`<w:top w:val="${b.val || 'single'}" w:sz="${b.sz || 6}" w:space="${b.space || 1}" w:color="${(b.color || 'CBD5E1').replace('#', '')}"/>`);
+    }
+    if (block.borders.left) {
+      const b = block.borders.left;
+      bdrParts.push(`<w:left w:val="${b.val || 'single'}" w:sz="${b.sz || 6}" w:space="${b.space || 1}" w:color="${(b.color || 'CBD5E1').replace('#', '')}"/>`);
+    }
+    if (block.borders.bottom) {
+      const b = block.borders.bottom;
+      bdrParts.push(`<w:bottom w:val="${b.val || 'single'}" w:sz="${b.sz || 6}" w:space="${b.space || 1}" w:color="${(b.color || 'CBD5E1').replace('#', '')}"/>`);
+    }
+    if (block.borders.right) {
+      const b = block.borders.right;
+      bdrParts.push(`<w:right w:val="${b.val || 'single'}" w:sz="${b.sz || 6}" w:space="${b.space || 1}" w:color="${(b.color || 'CBD5E1').replace('#', '')}"/>`);
+    }
+    if (bdrParts.length > 0) {
+      pPrElements.push(`<w:pBdr>${bdrParts.join("")}</w:pBdr>`);
+    }
+  }
+
+  // 4. shd (background shading fill)
+  if (block.bgColor) {
+    pPrElements.push(`<w:shd w:val="clear" w:color="auto" w:fill="${block.bgColor.replace('#', '').toUpperCase()}"/>`);
+  }
+
+  // 5. jc (alignment)
   if (block.alignment) {
     const jc = block.alignment === "justify" ? "both" : block.alignment;
     pPrElements.push(`<w:jc w:val="${jc}"/>`);
   }
 
-  // 4. tabs
+  // 6. tabs
   if (block.tabs && block.tabs.length > 0) {
     const tabXml = block.tabs
       .map((t) => `<w:tab w:val="${t.val}" w:pos="${Math.round(t.pos * 20)}"/>`)
@@ -1361,22 +1430,23 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
     pPrElements.push(`<w:tabs>${tabXml}</w:tabs>`);
   }
 
-  // 5. spacing (in twips: 1pt = 20 twips)
-  const before = block.spacingBefore !== undefined ? Math.round(block.spacingBefore * 20) : (block.isHeading ? 200 : 0);
-  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 80 : 0);
+  // 7. spacing (in twips: 1pt = 20 twips) - Tight accurate line spacing without ballooning
+  const before = block.spacingBefore !== undefined ? Math.round(block.spacingBefore * 20) : (block.isHeading ? 120 : 0);
+  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 40 : 0);
   let spAttrs = `w:before="${before}" w:after="${after}"`;
   if (block.lineSpacing && block.lineSpacing > 0) {
     spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="auto"`;
+  } else {
+    spAttrs += ` w:line="240" w:lineRule="auto"`;
   }
   pPrElements.push(`<w:spacing ${spAttrs}/>`);
 
-  // 6. ind (indentation)
+  // 8. ind (indentation)
   const indParts: string[] = [];
   if (block.leftIndent !== undefined && block.leftIndent > 0) indParts.push(`w:left="${Math.round(block.leftIndent * 20)}"`);
   if (block.rightIndent !== undefined && block.rightIndent > 0) indParts.push(`w:right="${Math.round(block.rightIndent * 20)}"`);
   if (block.firstLineIndent !== undefined && block.firstLineIndent > 0) indParts.push(`w:firstLine="${Math.round(block.firstLineIndent * 20)}"`);
   if (block.hangingIndent !== undefined && block.hangingIndent > 0) indParts.push(`w:hanging="${Math.round(block.hangingIndent * 20)}"`);
-  else if (block.isListItem && (!block.leftIndent || block.leftIndent === 0)) indParts.push('w:left="720" w:hanging="360"');
   if (indParts.length > 0) pPrElements.push(`<w:ind ${indParts.join(" ")}/>`);
 
   const pPr = pPrElements.length > 0 ? `<w:pPr>${pPrElements.join("")}</w:pPr>` : "";
@@ -1720,6 +1790,32 @@ export function generateRealDocxBlob(
         bodyXmlParts.push(buildParagraphXml(block));
       } else if (block.type === "table") {
         const tbl = block as DocxTableBlock;
+        const isBorderless = tbl.borderStyle === "none";
+        const tblBordersXml = isBorderless
+          ? `<w:tblBorders>
+              <w:top w:val="none"/>
+              <w:left w:val="none"/>
+              <w:bottom w:val="none"/>
+              <w:right w:val="none"/>
+              <w:insideH w:val="none"/>
+              <w:insideV w:val="none"/>
+            </w:tblBorders>`
+          : `<w:tblBorders>
+              <w:top w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
+              <w:bottom w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
+              <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+              <w:insideV w:val="none"/>
+            </w:tblBorders>`;
+
+        const tblGridXml =
+          tbl.colWidths && tbl.colWidths.length > 0
+            ? `<w:tblGrid>${tbl.colWidths.map((w) => `<w:gridCol w:w="${Math.round(w * 20)}"/>`).join("")}</w:tblGrid>`
+            : "";
+
+        const tblCellMarXml = isBorderless
+          ? `<w:tblCellMar><w:top w:w="30" w:type="dxa"/><w:bottom w:w="30" w:type="dxa"/><w:left w:w="0" w:type="dxa"/><w:right w:w="60" w:type="dxa"/></w:tblCellMar>`
+          : `<w:tblCellMar><w:top w:w="120" w:type="dxa"/><w:bottom w:w="120" w:type="dxa"/><w:left w:w="140" w:type="dxa"/><w:right w:w="140" w:type="dxa"/></w:tblCellMar>`;
+
         const rowsXml = (tbl.rows || [])
           .map((row) => {
             const cellsXml = (row.cells || [])
@@ -1734,7 +1830,11 @@ export function generateRealDocxBlob(
                 if (cell.colSpan && cell.colSpan > 1) {
                   tcPrParts.push(`<w:gridSpan w:val="${cell.colSpan}"/>`);
                 }
-                tcPrParts.push(`<w:tcMar><w:top w:w="120"/><w:bottom w:w="120"/><w:left w:w="140"/><w:right w:w="140"/></w:tcMar>`);
+                if (isBorderless) {
+                  tcPrParts.push(`<w:tcMar><w:top w:w="20"/><w:bottom w:w="20"/><w:left w:w="0"/><w:right w:w="40"/></w:tcMar>`);
+                } else {
+                  tcPrParts.push(`<w:tcMar><w:top w:w="120"/><w:bottom w:w="120"/><w:left w:w="140"/><w:right w:w="140"/></w:tcMar>`);
+                }
 
                 const innerBlocks = (cell.blocks || [])
                   .map((cellBlock) => {
@@ -1760,15 +1860,12 @@ export function generateRealDocxBlob(
 
         bodyXmlParts.push(`<w:tbl>
           <w:tblPr>
-            <w:tblStyle w:val="TableGrid"/>
+            <w:tblStyle w:val="${isBorderless ? 'NormalTable' : 'TableGrid'}"/>
             <w:tblW w:w="0" w:type="auto"/>
-            <w:tblBorders>
-              <w:top w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
-              <w:bottom w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
-              <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
-              <w:insideV w:val="none"/>
-            </w:tblBorders>
+            ${tblBordersXml}
+            ${tblCellMarXml}
           </w:tblPr>
+          ${tblGridXml}
           ${rowsXml}
         </w:tbl>`);
       } else if (block.type === "image") {
@@ -1789,7 +1886,11 @@ export function generateRealDocxBlob(
           `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${imgFileName}"/>`
         );
 
-        bodyXmlParts.push(`<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="80" w:after="80"/></w:pPr>${buildImageDrawingXml(img, imageCounter, maxAvailW, maxAvailH)}</w:p>`);
+        const isAbs = img.position === "absolute" && img.x !== undefined && img.y !== undefined;
+        const imgPPr = isAbs
+          ? `<w:pPr><w:spacing w:before="0" w:after="0"/><w:rPr><w:sz w:val="2"/><w:szCs w:val="2"/></w:rPr></w:pPr>`
+          : `<w:pPr><w:jc w:val="center"/><w:spacing w:before="60" w:after="60"/></w:pPr>`;
+        bodyXmlParts.push(`<w:p>${imgPPr}${buildImageDrawingXml(img, imageCounter, maxAvailW, maxAvailH)}</w:p>`);
       }
     }
 

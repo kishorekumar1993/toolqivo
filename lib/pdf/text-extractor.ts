@@ -9,7 +9,24 @@
  */
 
 import { getPdfJs } from "./loader";
-import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxImageBlock, DocxBlock, DocxSection, DocxTextRun } from "../document/docx";
+import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxImageBlock, DocxBlock, DocxSection, DocxTextRun, DocxParagraphBorders, DocxTableRow } from "../document/docx";
+
+export interface PdfVectorLine {
+  x: number;
+  topY: number;
+  width: number;
+  height: number;
+  color?: string;
+  orientation: "h" | "v";
+}
+
+export interface PdfFilledBox {
+  x: number;
+  topY: number;
+  width: number;
+  height: number;
+  bgColor: string;
+}
 
 export interface PdfTextItem {
   str: string;
@@ -136,8 +153,30 @@ function decodePdfHexString(hex: string): string {
   return new TextDecoder("latin1").decode(bytes);
 }
 
+function parseJpegDimensions(bytes: Uint8Array): { width: number; height: number } | null {
+  let offset = 2;
+  while (offset < bytes.length - 8) {
+    if (bytes[offset] !== 0xff) {
+      offset++;
+      continue;
+    }
+    const marker = bytes[offset + 1];
+    if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+      const height = (bytes[offset + 5] << 8) | bytes[offset + 6];
+      const width = (bytes[offset + 7] << 8) | bytes[offset + 8];
+      if (width > 0 && height > 0) {
+        return { width, height };
+      }
+    }
+    const len = (bytes[offset + 2] << 8) | bytes[offset + 3];
+    if (len <= 0) break;
+    offset += 2 + len;
+  }
+  return null;
+}
+
 /**
- * Extract native JPEG images from raw PDF byte stream (Strict Fallback only)
+ * Extract native JPEG images from raw PDF byte stream with authentic dimensions (Strict Fallback only)
  */
 function extractImagesFromPdfBytes(buffer: ArrayBuffer): DocxImageBlock[] {
   const images: DocxImageBlock[] = [];
@@ -155,12 +194,23 @@ function extractImagesFromPdfBytes(buffer: ArrayBuffer): DocxImageBlock[] {
           const imgLen = end - start;
           if (imgLen > 4096 && imgLen < 20 * 1024 * 1024) {
             const imgData = bytes.slice(start, end);
+            const dim = parseJpegDimensions(imgData);
+            const maxW = 460;
+            let w = dim ? dim.width : 380;
+            let h = dim ? dim.height : 240;
+
+            if (w > maxW) {
+              const scale = maxW / w;
+              w = maxW;
+              h = Math.round(h * scale);
+            }
+
             images.push({
               type: "image",
               data: imgData,
               mimeType: "image/jpeg",
-              width: 380,
-              height: 240,
+              width: w,
+              height: h,
               position: "inline",
               altText: `Extracted Graphic ${images.length + 1}`,
             });
@@ -193,7 +243,7 @@ function extractTextFromContentStream(streamText: string): string {
     let currentLine = "";
 
     const tokenRegex = /\((?:[^()\\]|\\.)*\)\s*(?:Tj|'|")|<[0-9a-fA-F\s]+>\s*(?:Tj|'|")|\[(?:[^[\]()]|\((?:[^()\\]|\\.)*\)|<[0-9a-fA-F\s]+>)*\]\s*TJ|T\*|(?:\d+(?:\.\d+)?\s+){2}T[dD]/g;
-    
+
     let match: RegExpExecArray | null;
     while ((match = tokenRegex.exec(block)) !== null) {
       const op = match[0].trim();
@@ -255,7 +305,7 @@ async function decompressFlate(data: Uint8Array): Promise<string> {
       try {
         const stream = new Blob([data as BlobPart]).stream().pipeThrough(new DecompressionStream("deflate"));
         return await new Response(stream).text();
-      } catch {}
+      } catch { }
     }
   }
   return new TextDecoder("latin1").decode(data);
@@ -322,8 +372,8 @@ async function extractTextViaStreams(buffer: ArrayBuffer): Promise<{ text: strin
 function clusterTextItemsIntoLines(
   items: any[],
   styles: Record<string, any> = {},
-  textColors: (string | undefined)[] = [],
-  underlines: { x: number; topY: number; width: number; height: number }[] = [],
+  spatialColors: { x: number; topY: number; color: string }[] = [],
+  vectorLines: PdfVectorLine[] = [],
   viewportWidth: number = 595,
   viewportHeight: number = 842
 ): { lines: PdfSpatialLine[]; pageMinX: number } {
@@ -357,13 +407,28 @@ function clusterTextItemsIntoLines(
 
     const isBold = /bold|black|heavy|semibold|medium|700|800|900|demi/i.test(combinedFont);
     const isItalic = /italic|oblique|slanted|inclined/i.test(combinedFont);
-    const color = textColors[idx] || undefined;
+
+    // Accurate 2D spatial text color matching (eliminates 1:1 index mismatch bug)
+    let color: string | undefined = undefined;
+    let minDist = 45;
+    for (const sc of spatialColors) {
+      const dy = Math.abs(sc.topY - topY);
+      if (dy <= 8) {
+        const dx = Math.abs(sc.x - x);
+        if (dx < minDist) {
+          minDist = dx;
+          color = sc.color;
+        }
+      }
+    }
 
     // Detect underline from drawn line segments in PDF or font styles
     const itemWidth = it.width || str.length * fontSize * 0.52;
-    const hasDrawnUnderline = underlines.some((u) => {
-      const yDiff = Math.abs(u.topY - topY);
-      if (yDiff > 7.0) return false;
+    const hasDrawnUnderline = vectorLines.some((u) => {
+      if (u.orientation !== "h" || u.height > 3.5) return false;
+      const yDiff = Math.abs(u.topY - (topY + fontSize));
+      const directYDiff = Math.abs(u.topY - topY);
+      if (yDiff > 6.0 && directYDiff > 6.0) return false;
       const overlapMin = Math.max(u.x, x - 2);
       const overlapMax = Math.min(u.x + u.width, x + itemWidth + 2);
       const overlapWidth = overlapMax - overlapMin;
@@ -392,20 +457,90 @@ function clusterTextItemsIntoLines(
 
   const pageMinX = Math.min(...rawItems.map((it) => it.x));
 
-  // Sort items strictly from top to bottom (descending Y), then left to right (ascending X)
-  rawItems.sort((a, b) => {
-    const dy = b.y - a.y;
-    if (Math.abs(dy) > 3.0) {
-      return dy;
+  // Multi-Column / Sidebar Detection:
+  // Check if body items cleanly divide into 2 distinct columns with a clear vertical gutter
+  let sortedItems: PdfTextItem[] = [];
+
+  // Find potential vertical split gutter between 25% and 65% of viewport width
+  let bestSplitX = -1;
+  let minCrossingItems = Infinity;
+
+  for (let splitCandidate = Math.round(viewportWidth * 0.25); splitCandidate <= Math.round(viewportWidth * 0.65); splitCandidate += 15) {
+    let leftCount = 0;
+    let rightCount = 0;
+    let crossingCount = 0;
+
+    for (const it of rawItems) {
+      const itRight = it.x + it.width;
+      if (itRight <= splitCandidate + 6) {
+        leftCount++;
+      } else if (it.x >= splitCandidate - 6) {
+        rightCount++;
+      } else {
+        crossingCount++;
+      }
     }
-    return a.x - b.x;
-  });
+
+    if (leftCount >= 6 && rightCount >= 6 && crossingCount < minCrossingItems) {
+      minCrossingItems = crossingCount;
+      bestSplitX = splitCandidate;
+    }
+  }
+
+  const isMultiColumnPage =
+    bestSplitX > 0 &&
+    minCrossingItems <= Math.max(3, rawItems.length * 0.08);
+
+  if (isMultiColumnPage) {
+    const headerItems: PdfTextItem[] = [];
+    const leftColItems: PdfTextItem[] = [];
+    const rightColItems: PdfTextItem[] = [];
+    const footerItems: PdfTextItem[] = [];
+
+    // Header threshold: items in top 15% of page that span wide
+    for (const it of rawItems) {
+      const itRight = it.x + it.width;
+      const isWide = it.width >= viewportWidth * 0.45;
+      const isTopZone = it.topY < viewportHeight * 0.16;
+
+      if ((isTopZone && isWide) || (it.topY < 90 && isWide)) {
+        headerItems.push(it);
+      } else if (it.topY > viewportHeight * 0.90 && isWide) {
+        footerItems.push(it);
+      } else if (itRight <= bestSplitX + 8) {
+        leftColItems.push(it);
+      } else {
+        rightColItems.push(it);
+      }
+    }
+
+    const sortTopDown = (a: PdfTextItem, b: PdfTextItem) => {
+      const dy = b.y - a.y;
+      if (Math.abs(dy) > 3.0) return dy;
+      return a.x - b.x;
+    };
+
+    headerItems.sort(sortTopDown);
+    leftColItems.sort(sortTopDown);
+    rightColItems.sort(sortTopDown);
+    footerItems.sort(sortTopDown);
+
+    sortedItems = [...headerItems, ...leftColItems, ...rightColItems, ...footerItems];
+  } else {
+    // Single column: standard top-to-bottom, left-to-right reading order
+    rawItems.sort((a, b) => {
+      const dy = b.y - a.y;
+      if (Math.abs(dy) > 3.0) return dy;
+      return a.x - b.x;
+    });
+    sortedItems = rawItems;
+  }
 
   const lines: PdfSpatialLine[] = [];
   let currentGroup: PdfTextItem[] = [];
   let currentY: number | null = null;
 
-  for (const item of rawItems) {
+  for (const item of sortedItems) {
     if (currentY === null) {
       currentY = item.y;
       currentGroup = [item];
@@ -414,8 +549,9 @@ function clusterTextItemsIntoLines(
       const fontSizeDiff = Math.abs(item.fontSize - avgGroupFontSize);
       const yDiff = Math.abs(item.y - currentY);
 
-      // Same visual line if vertical offset <= 3.2pt
-      const isSameLine = yDiff <= 3.2 && (fontSizeDiff <= 4 || yDiff <= 1.5);
+      // Relative line clustering tolerance based on font size
+      const tolerance = Math.max(1.5, Math.min(5.5, avgGroupFontSize * 0.28));
+      const isSameLine = yDiff <= tolerance && (fontSizeDiff <= 4.5 || yDiff <= 1.5);
 
       if (isSameLine) {
         currentGroup.push(item);
@@ -496,14 +632,16 @@ function buildSpatialLine(
     }
   }
 
-  // Heading classification
+  // Heading & Subheading classification
   const isShortLine = cleanText.length < 80;
-  const isAllUpper = /^[A-Z0-9\s&/,\-–—|:]{4,70}$/.test(cleanText) && !cleanText.includes("@") && !cleanText.includes(".com");
+  const isAllUpper = /^[A-Z0-9\s&/,\-–—|:]{3,70}$/.test(cleanText) && !cleanText.includes("@") && !cleanText.includes(".com");
   const isMajorHeading = avgFontSize >= 16;
-  const isSectionHeading = (avgFontSize >= 12.5 && isBold && isShortLine) || (isAllUpper && (isBold || avgFontSize >= 12));
+  const isSectionHeading = (avgFontSize >= 12.5 && isBold && isShortLine) || (isAllUpper && (isBold || avgFontSize >= 11.5) && isShortLine);
+  const hasAccentColor = Boolean(color && color !== "000000" && color !== "111827" && color !== "333333");
+  const isSubheading = (avgFontSize >= 10.5 && isBold && isShortLine) || (hasAccentColor && (isBold || avgFontSize >= 10.5) && isShortLine);
 
-  const isHeading = isMajorHeading || isSectionHeading;
-  const headingLevel = avgFontSize >= 20 ? 1 : avgFontSize >= 14 ? 2 : 3;
+  const isHeading = isMajorHeading || isSectionHeading || isSubheading;
+  const headingLevel = isMajorHeading ? (avgFontSize >= 20 ? 1 : 2) : isSectionHeading ? 2 : 3;
 
   // List detection (bullet or numbered)
   const isListItem = /^[•*–—\u2022\u25cf\u25cb\u25aa]\s+|^\d+[\.\)]\s+|^\[[ x]\]\s+/i.test(cleanText);
@@ -538,87 +676,263 @@ interface PageVisualElement {
 }
 
 /**
- * Coordinate-Preserving Layout Reconstruction Engine:
- * Emits physical lines as distinct positioned blocks with exact indents, tab stops, natural line spacing, and fonts.
+ * Analyzes whether a line contains distinct left and right columns (e.g. key-value or multi-column data)
+ */
+function analyzeLineColumns(line: PdfSpatialLine): {
+  isMultiCol: boolean;
+  leftItems: PdfTextItem[];
+  rightItems: PdfTextItem[];
+  splitX: number;
+} {
+  const items = line.items || [];
+  if (items.length < 2) {
+    return { isMultiCol: false, leftItems: items, rightItems: [], splitX: 0 };
+  }
+
+  for (let i = 0; i < items.length - 1; i++) {
+    const itA = items[i];
+    const itB = items[i + 1];
+    const gap = itB.x - (itA.x + itA.width);
+    if (gap >= 18.0 && itA.x < 240 && itB.x >= 120) {
+      const leftItems = items.slice(0, i + 1);
+      const rightItems = items.slice(i + 1);
+      return {
+        isMultiCol: true,
+        leftItems,
+        rightItems,
+        splitX: itB.x,
+      };
+    }
+  }
+
+  return { isMultiCol: false, leftItems: items, rightItems: [], splitX: 0 };
+}
+
+function buildRunsAndTabsFromItems(
+  items: PdfTextItem[],
+  defaultColor?: string
+): { runs: DocxTextRun[]; tabs: { val: "left" | "center" | "right"; pos: number }[] } {
+  const runs: DocxTextRun[] = [];
+  const tabs: { val: "left" | "center" | "right"; pos: number }[] = [];
+  let lastX = -1;
+  let lastW = 0;
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    let str = it.str;
+    if (lastX >= 0) {
+      const gap = it.x - (lastX + lastW);
+      if (gap >= 18.0 && it.x > 70) {
+        runs.push({ text: "\t", tab: true });
+        tabs.push({ val: "left", pos: it.x });
+      } else if (gap >= 1.5 && !str.startsWith(" ") && (runs.length === 0 || !runs[runs.length - 1].text.endsWith(" "))) {
+        str = " " + str;
+      }
+    }
+    lastX = it.x;
+    lastW = it.width;
+
+    const rawColor = it.color && it.color !== "000000" ? it.color : defaultColor;
+    const cleanColor = rawColor ? rawColor.replace("#", "").toUpperCase() : undefined;
+
+    runs.push({
+      text: str,
+      bold: it.isBold,
+      italic: it.isItalic,
+      underline: it.isUnderline,
+      fontSize: it.fontSize,
+      fontFamily: it.fontFamily,
+      color: cleanColor,
+    });
+  }
+
+  return { runs, tabs };
+}
+
+function buildRunsFromItems(items: PdfTextItem[], defaultColor?: string): DocxTextRun[] {
+  return buildRunsAndTabsFromItems(items, defaultColor).runs;
+}
+
+/**
+ * Coordinate-Preserving Hybrid Layout Reconstruction Engine:
+ * Converts multi-row key-value / skills sections (>=2 rows) into borderless Word layout tables,
+ * and emits physical lines as distinct positioned blocks with exact indents, natural line spacing, borders, shading, tabs, and fonts.
  */
 function reconstructPageBlocks(
   lines: PdfSpatialLine[],
   images: { image: DocxImageBlock; topY: number }[],
   pageMinX: number = 54,
-  viewportWidth: number = 595.28
+  viewportWidth: number = 595.28,
+  vectorLines: PdfVectorLine[] = [],
+  filledBoxes: PdfFilledBox[] = []
 ): DocxBlock[] {
   const elements: PageVisualElement[] = [];
-
   const leftMargin = Math.max(28, Math.min(54, Math.round(pageMinX)));
+  const availableWidth = viewportWidth - leftMargin * 2;
 
-  let prevLineTopY: number | null = null;
-  let prevLineFontSize: number = 10;
+  let lineIdx = 0;
+  let prevBlockTopY: number | null = null;
+  let prevBlockFontSize: number = 10;
+  const usedVectorLineIndices = new Set<number>();
 
-  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+  while (lineIdx < lines.length) {
     const line = lines[lineIdx];
     const items = line.items || [];
-    if (items.length === 0 && !line.text) continue;
+    if (items.length === 0 && !line.text) {
+      lineIdx++;
+      continue;
+    }
 
-    const runs: DocxTextRun[] = [];
-    const tabs: { val: "left" | "center" | "right"; pos: number }[] = [];
+    // Check if line and subsequent lines form a multi-row 2-column key-value or skills section (require >= 2 rows)
+    const colInfo = analyzeLineColumns(line);
+    if (colInfo.isMultiCol && !line.isHeading) {
+      const tableRows: DocxTableRow[] = [];
+      const tableTopY = line.topY;
+      const splitX = colInfo.splitX;
+      const leftColWidth = Math.max(60, Math.min(220, Math.round(splitX - leftMargin)));
+      const rightColWidth = Math.max(100, Math.round(availableWidth - leftColWidth));
 
-    let prevItemX = -1;
-    let prevItemW = 0;
+      let scanIdx = lineIdx;
+      while (scanIdx < lines.length) {
+        const curLine = lines[scanIdx];
+        if (curLine.isHeading) break;
 
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      let str = it.str;
-
-      if (prevItemX >= 0) {
-        const gap = it.x - (prevItemX + prevItemW);
-        if (gap >= 16.0) {
-          // Horizontal gap: insert an explicit Word tab stop positioned at exact relative horizontal coordinate
-          const tabPos = Math.max(10, Math.round(it.x - leftMargin));
-          tabs.push({ val: "left", pos: tabPos });
-          runs.push({ text: "", tab: true });
-        } else if (gap >= 1.8 && !str.startsWith(" ") && (runs.length === 0 || !runs[runs.length - 1].text.endsWith(" "))) {
-          str = " " + str;
+        const curColInfo = analyzeLineColumns(curLine);
+        if (curColInfo.isMultiCol && Math.abs(curColInfo.splitX - splitX) <= 35) {
+          const lRuns = buildRunsFromItems(curColInfo.leftItems, curLine.color);
+          const rRuns = buildRunsFromItems(curColInfo.rightItems, curLine.color);
+          tableRows.push({
+            cells: [
+              {
+                width: leftColWidth,
+                blocks: [{ type: "paragraph", runs: lRuns.length > 0 ? lRuns : [{ text: "" }], alignment: "left" }],
+              },
+              {
+                width: rightColWidth,
+                blocks: [{ type: "paragraph", runs: rRuns.length > 0 ? rRuns : [{ text: "" }], alignment: "left" }],
+              },
+            ],
+          });
+          scanIdx++;
+        } else if (curLine.minX >= splitX - 25 && curLine.maxX > splitX + 30 && tableRows.length > 0) {
+          const rRuns = buildRunsFromItems(curLine.items, curLine.color);
+          tableRows.push({
+            cells: [
+              {
+                width: leftColWidth,
+                blocks: [{ type: "paragraph", runs: [{ text: "" }], alignment: "left" }],
+              },
+              {
+                width: rightColWidth,
+                blocks: [{ type: "paragraph", runs: rRuns.length > 0 ? rRuns : [{ text: curLine.text }], alignment: "left" }],
+              },
+            ],
+          });
+          scanIdx++;
+        } else {
+          break;
         }
       }
 
-      prevItemX = it.x;
-      prevItemW = it.width;
-
-      runs.push({
-        text: str,
-        bold: it.isBold,
-        italic: it.isItalic,
-        underline: it.isUnderline,
-        fontSize: it.fontSize,
-        fontFamily: it.fontFamily,
-        color: it.color,
-      });
+      // Only create table if 2 or more rows matched the column grid. Otherwise, process as single line with tabs.
+      if (tableRows.length >= 2) {
+        elements.push({
+          topY: tableTopY,
+          block: {
+            type: "table",
+            borderStyle: "none",
+            colWidths: [leftColWidth, rightColWidth],
+            rows: tableRows,
+          },
+        });
+        prevBlockTopY = tableTopY;
+        lineIdx = scanIdx;
+        continue;
+      }
     }
 
-    // Baseline step distance between lines:
-    // Regular consecutive lines (baselineStep <= fontSize * 1.35) have spacingBefore = 0.
-    // Only actual intentional paragraph/section gaps have spacingBefore > 0.
+    // Normal paragraph line
+    const { runs, tabs } = buildRunsAndTabsFromItems(items, line.color);
+
     let spacingBefore = 0;
-    if (prevLineTopY !== null) {
-      const baselineStep = line.topY - prevLineTopY;
-      const normalStep = prevLineFontSize * 1.35;
-      if (baselineStep > normalStep + 3.0) {
+    if (prevBlockTopY !== null) {
+      const baselineStep = line.topY - prevBlockTopY;
+      const normalStep = prevBlockFontSize * 1.30;
+      if (baselineStep > normalStep * 1.55) {
         const extraGap = baselineStep - normalStep;
-        spacingBefore = Math.min(36, Math.max(0, Math.round(extraGap)));
+        spacingBefore = Math.min(14, Math.max(2, Math.round(extraGap * 0.70)));
       }
     }
 
     if (line.isHeading) {
-      spacingBefore = Math.max(spacingBefore, line.headingLevel === 1 ? 12 : 6);
+      spacingBefore = Math.max(spacingBefore, line.headingLevel === 1 ? 8 : 4);
     }
 
-    const spacingAfter = line.isHeading ? 2 : 0;
+    const spacingAfter = line.isHeading ? 1 : 0;
+
+    // Detect bottom border divider line (specifically for headings with a section line underneath)
+    let bottomBorder: DocxParagraphBorders["bottom"] | undefined = undefined;
+    if (line.isHeading || line.headingLevel) {
+      for (let vIdx = 0; vIdx < vectorLines.length; vIdx++) {
+        const vLine = vectorLines[vIdx];
+        if (vLine.orientation !== "h" || vLine.width < 28) continue;
+
+        const lineBottom = line.topY + line.fontSize;
+        const isNearBottom = vLine.topY >= line.topY - 1 && vLine.topY <= lineBottom + 10;
+        const hOverlap = Math.min(line.maxX, vLine.x + vLine.width) - Math.max(line.minX, vLine.x);
+        const isHorizAligned = hOverlap >= Math.min(20, (line.maxX - line.minX) * 0.4) || (vLine.width >= viewportWidth * 0.35);
+
+        if (isNearBottom && isHorizAligned) {
+          bottomBorder = {
+            val: "single",
+            sz: Math.max(4, Math.min(16, Math.round(vLine.height * 6))),
+            color: vLine.color && vLine.color !== "000000" ? vLine.color.replace("#", "").toUpperCase() : "CBD5E1",
+          };
+          usedVectorLineIndices.add(vIdx);
+          break;
+        }
+      }
+    }
+
+    // Detect light background tint shading box (e.g. highlighted callout or soft banner)
+    let bgColor: string | undefined = undefined;
+    for (const box of filledBoxes) {
+      if (box.width < 16 || box.height < 8) continue;
+      const isContained =
+        line.minX >= box.x - 8 &&
+        line.maxX <= box.x + box.width + 8 &&
+        line.topY >= box.topY - 4 &&
+        line.topY <= box.topY + box.height + 4;
+
+      if (isContained && box.bgColor) {
+        bgColor = box.bgColor.replace("#", "").toUpperCase();
+        break;
+      }
+    }
+
+    const paragraphBorders: DocxParagraphBorders | undefined =
+      bottomBorder ? { bottom: bottomBorder } : undefined;
+
+    const fallbackColor = line.color && line.color !== "000000" ? line.color.replace("#", "").toUpperCase() : undefined;
 
     elements.push({
       topY: line.topY,
       block: {
         type: "paragraph",
-        runs: runs.length > 0 ? runs : [{ text: line.text, bold: line.isBold, italic: line.isItalic, underline: line.isUnderline, fontSize: line.fontSize, fontFamily: line.fontFamily, color: line.color }],
+        runs:
+          runs.length > 0
+            ? runs
+            : [
+              {
+                text: line.text,
+                bold: line.isBold,
+                italic: line.isItalic,
+                underline: line.isUnderline,
+                fontSize: line.fontSize,
+                fontFamily: line.fontFamily,
+                color: fallbackColor,
+              },
+            ],
         alignment: line.alignment,
         leftIndent: line.alignment === "left" && line.leftIndent !== undefined && line.leftIndent > 3 ? line.leftIndent : undefined,
         tabs: tabs.length > 0 ? tabs : undefined,
@@ -627,11 +941,14 @@ function reconstructPageBlocks(
         isListItem: line.isListItem,
         spacingBefore,
         spacingAfter,
+        borders: paragraphBorders,
+        bgColor,
       },
     });
 
-    prevLineTopY = line.topY;
-    prevLineFontSize = line.fontSize || 10;
+    prevBlockTopY = line.topY;
+    prevBlockFontSize = line.fontSize || 10;
+    lineIdx++;
   }
 
   // Add extracted images with their topY positions
@@ -683,7 +1000,7 @@ function parseColorToHex(args: any[]): string | undefined {
 }
 
 /**
- * Universal Image, Underline & Text Color Extractor from PDF.js Operator List
+ * Universal Image, Underline, Vector Line, Shading & Spatial Text Color Extractor from PDF.js Operator List
  */
 async function extractImagesAndColorsFromPdfJsPage(
   page: any,
@@ -691,18 +1008,22 @@ async function extractImagesAndColorsFromPdfJsPage(
   pdfjs: any
 ): Promise<{
   images: { image: DocxImageBlock; topY: number }[];
-  textColors: (string | undefined)[];
-  underlines: { x: number; topY: number; width: number; height: number }[];
+  spatialColors: { x: number; topY: number; color: string }[];
+  vectorLines: PdfVectorLine[];
+  filledBoxes: PdfFilledBox[];
 }> {
   const images: { image: DocxImageBlock; topY: number }[] = [];
-  const textColors: (string | undefined)[] = [];
-  const underlines: { x: number; topY: number; width: number; height: number }[] = [];
+  const spatialColors: { x: number; topY: number; color: string }[] = [];
+  const vectorLines: PdfVectorLine[] = [];
+  const filledBoxes: PdfFilledBox[] = [];
   const seenImageKeys = new Set<string>();
+  const seenLineKeys = new Set<string>();
+  const seenBoxKeys = new Set<string>();
 
   try {
     const opList = await page.getOperatorList();
     if (!opList?.fnArray || !opList?.argsArray) {
-      return { images, textColors, underlines };
+      return { images, spatialColors, vectorLines, filledBoxes };
     }
 
     const fnArray = opList.fnArray;
@@ -732,6 +1053,29 @@ async function extractImagesAndColorsFromPdfJsPage(
         m[0] * px + m[2] * py + m[4],
         m[1] * px + m[3] * py + m[5],
       ];
+    };
+
+    const addVectorLine = (x: number, topY: number, width: number, height: number, color: string | undefined, orientation: "h" | "v") => {
+      const key = `${orientation}_${Math.round(x / 3)}_${Math.round(topY / 3)}_${Math.round(width / 3)}_${Math.round(height / 3)}`;
+      if (seenLineKeys.has(key)) return;
+      seenLineKeys.add(key);
+      vectorLines.push({ x, topY, width, height, color, orientation });
+    };
+
+    const addFilledBox = (x: number, topY: number, width: number, height: number, bgColor: string) => {
+      if (!bgColor) return;
+      const cleanHex = bgColor.replace("#", "").toUpperCase().trim();
+      // Ignore pure white, 0-length or invalid hex codes
+      if (cleanHex === "FFFFFF" || cleanHex === "FFF" || cleanHex.length !== 6) return;
+
+      // Ignore whole-page canvas background covers (>= 95% of page dimensions)
+      const isFullPageCover = width >= viewport.width * 0.95 && height >= viewport.height * 0.95;
+      if (isFullPageCover) return;
+
+      const key = `${Math.round(x / 4)}_${Math.round(topY / 4)}_${Math.round(width / 4)}_${Math.round(height / 4)}_${cleanHex}`;
+      if (seenBoxKeys.has(key)) return;
+      seenBoxKeys.add(key);
+      filledBoxes.push({ x, topY, width, height, bgColor: cleanHex });
     };
 
     const PAINT_IMAGE_XOBJECT = pdfjs?.OPS?.paintImageXObject ?? 85;
@@ -788,13 +1132,21 @@ async function extractImagesAndColorsFromPdfJsPage(
         continue;
       }
 
-      // Text tracking
+      // 2D Spatial Text color tracking
       if (fn === SHOW_TEXT || fn === SHOW_SPACED_TEXT) {
-        textColors.push(currentFillColor || currentStrokeColor);
+        const col = currentFillColor || currentStrokeColor;
+        if (col && col !== "000000") {
+          const [tx, ty] = transformPoint(currentTransform, 0, 0);
+          spatialColors.push({
+            x: tx,
+            topY: Math.max(0, viewport.height - ty),
+            color: col,
+          });
+        }
         continue;
       }
 
-      // Path / Underline tracking from constructPath
+      // Path / Line / Box tracking from constructPath
       if (fn === CONSTRUCT_PATH && args && args.length >= 2) {
         const [subOps, subArgs] = args;
         if (Array.isArray(subOps) && Array.isArray(subArgs)) {
@@ -814,13 +1166,13 @@ async function extractImagesAndColorsFromPdfJsPage(
                 const [tx2, ty2] = transformPoint(currentTransform, curPt[0], curPt[1]);
                 const lineWidth = Math.abs(tx2 - tx1);
                 const lineHeight = Math.abs(ty2 - ty1);
-                if (lineHeight <= 3.5 && lineWidth >= 6.0) {
-                  underlines.push({
-                    x: Math.min(tx1, tx2),
-                    topY: Math.max(0, viewport.height - Math.max(ty1, ty2)),
-                    width: lineWidth,
-                    height: Math.max(1, lineHeight),
-                  });
+                const minX = Math.min(tx1, tx2);
+                const topY = Math.max(0, viewport.height - Math.max(ty1, ty2));
+
+                if (lineHeight <= 4.0 && lineWidth >= 6.0) {
+                  addVectorLine(minX, topY, lineWidth, Math.max(1, lineHeight), currentStrokeColor || currentFillColor || "CBD5E1", "h");
+                } else if (lineWidth <= 6.0 && lineHeight >= 8.0) {
+                  addVectorLine(minX, topY, Math.max(1, lineWidth), lineHeight, currentStrokeColor || currentFillColor || "2563EB", "v");
                 }
               }
               lastMove = curPt;
@@ -839,13 +1191,14 @@ async function extractImagesAndColorsFromPdfJsPage(
               const maxY = Math.max(ty1, ty2);
               const w = maxX - minX;
               const h = maxY - minY;
+              const topY = Math.max(0, viewport.height - maxY);
+
               if (h <= 4.0 && w >= 6.0) {
-                underlines.push({
-                  x: minX,
-                  topY: Math.max(0, viewport.height - maxY),
-                  width: w,
-                  height: Math.max(1, h),
-                });
+                addVectorLine(minX, topY, w, Math.max(1, h), currentFillColor || currentStrokeColor || "CBD5E1", "h");
+              } else if (w <= 6.0 && h >= 8.0) {
+                addVectorLine(minX, topY, Math.max(1, w), h, currentFillColor || currentStrokeColor || "2563EB", "v");
+              } else if (w >= 16.0 && h >= 8.0 && currentFillColor && currentFillColor !== "FFFFFF" && currentFillColor !== "FFF") {
+                addFilledBox(minX, topY, w, h, currentFillColor);
               }
             } else if (subOp === (pdfjs?.OPS?.bezierCurveTo ?? 15) || subOp === (pdfjs?.OPS?.curveTo ?? 16)) {
               argPtr += 6;
@@ -869,13 +1222,14 @@ async function extractImagesAndColorsFromPdfJsPage(
         const maxY = Math.max(ty1, ty2);
         const w = maxX - minX;
         const h = maxY - minY;
+        const topY = Math.max(0, viewport.height - maxY);
+
         if (h <= 4.0 && w >= 6.0) {
-          underlines.push({
-            x: minX,
-            topY: Math.max(0, viewport.height - maxY),
-            width: w,
-            height: Math.max(1, h),
-          });
+          addVectorLine(minX, topY, w, Math.max(1, h), currentFillColor || currentStrokeColor || "CBD5E1", "h");
+        } else if (w <= 6.0 && h >= 8.0) {
+          addVectorLine(minX, topY, Math.max(1, w), h, currentFillColor || currentStrokeColor || "2563EB", "v");
+        } else if (w >= 16.0 && h >= 8.0 && currentFillColor && currentFillColor !== "FFFFFF" && currentFillColor !== "FFF") {
+          addFilledBox(minX, topY, w, h, currentFillColor);
         }
         continue;
       }
@@ -957,7 +1311,7 @@ async function extractImagesAndColorsFromPdfJsPage(
           continue;
         }
 
-        // Calculate spatial metrics
+        // Calculate spatial metrics via 4 transformed corners
         const a = currentTransform[0] || 1;
         const b = currentTransform[1] || 0;
         const c = currentTransform[2] || 0;
@@ -965,22 +1319,37 @@ async function extractImagesAndColorsFromPdfJsPage(
         const e = currentTransform[4] || 0;
         const f = currentTransform[5] || 0;
 
-        let ptWidth = Math.sqrt(a * a + b * b);
-        let ptHeight = Math.sqrt(c * c + d * d);
+        // 4 corners of unit image square in PDF space: (0,0), (1,0), (0,1), (1,1)
+        const c0x = e;
+        const c0y = f;
+        const c1x = a + e;
+        const c1y = b + f;
+        const c2x = c + e;
+        const c2y = d + f;
+        const c3x = a + c + e;
+        const c3y = b + d + f;
 
-        if (!Number.isFinite(ptWidth) || ptWidth < 20) ptWidth = Math.min(width, 360);
-        if (!Number.isFinite(ptHeight) || ptHeight < 20) ptHeight = Math.min(height, 280);
+        const minPdfX = Math.min(c0x, c1x, c2x, c3x);
+        const maxPdfX = Math.max(c0x, c1x, c2x, c3x);
+        const minPdfY = Math.min(c0y, c1y, c2y, c3y);
+        const maxPdfY = Math.max(c0y, c1y, c2y, c3y);
+
+        let ptWidth = maxPdfX - minPdfX;
+        let ptHeight = maxPdfY - minPdfY;
+
+        if (!Number.isFinite(ptWidth) || ptWidth < 10) ptWidth = Math.min(width, 360);
+        if (!Number.isFinite(ptHeight) || ptHeight < 10) ptHeight = Math.min(height, 280);
 
         const aspect = ptWidth / Math.max(1, ptHeight);
-        if (aspect > 30 || aspect < 0.03) {
+        if (aspect > 35 || aspect < 0.02) {
           continue;
         }
 
-        let ptX = Math.max(0, e);
-        let topY = Math.max(0, viewport.height - (f + ptHeight));
+        const ptX = Math.max(0, minPdfX);
+        const topY = Math.max(0, viewport.height - maxPdfY);
 
-        ptWidth = Math.max(20, Math.min(ptWidth, viewport.width));
-        ptHeight = Math.max(20, Math.min(ptHeight, viewport.height));
+        ptWidth = Math.max(10, Math.min(ptWidth, viewport.width));
+        ptHeight = Math.max(10, Math.min(ptHeight, viewport.height));
 
         const dedupKey = `${typeof imgArg === "string" ? imgArg : "inline"}_${Math.round(ptX / 8)}_${Math.round(topY / 8)}_${Math.round(ptWidth / 8)}_${Math.round(ptHeight / 8)}`;
         if (seenImageKeys.has(dedupKey)) {
@@ -1091,7 +1460,7 @@ async function extractImagesAndColorsFromPdfJsPage(
     console.warn("extractImagesAndColorsFromPdfJsPage warning:", error);
   }
 
-  return { images, textColors, underlines };
+  return { images, spatialColors, vectorLines, filledBoxes };
 }
 
 /**
@@ -1113,27 +1482,39 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
         const page = await pdfDoc.getPage(p);
         const viewport = page.getViewport({ scale: 1.0 });
         const textContent = await page.getTextContent();
-        
-        // Extract genuine high-res images, text colors & underlines from PDF.js operator stream
+
+        // Extract genuine high-res images, spatial colors, vector lines & filled boxes from PDF.js operator stream
         const pageAssets = await extractImagesAndColorsFromPdfJsPage(page, viewport, pdfjs);
 
         const { lines: pageLines, pageMinX } = clusterTextItemsIntoLines(
           textContent.items,
           textContent.styles || {},
-          pageAssets.textColors || [],
-          pageAssets.underlines || [],
+          pageAssets.spatialColors || [],
+          pageAssets.vectorLines || [],
           viewport.width,
           viewport.height
         );
 
-        // Reconstruct unified blocks in exact top-to-bottom reading order with typography & colors
-        const finalPageBlocks = reconstructPageBlocks(pageLines, pageAssets.images, pageMinX, viewport.width);
+        // Reconstruct unified blocks in exact top-to-bottom reading order with typography, borders, backgrounds & colors
+        const finalPageBlocks = reconstructPageBlocks(
+          pageLines,
+          pageAssets.images,
+          pageMinX,
+          viewport.width,
+          pageAssets.vectorLines || [],
+          pageAssets.filledBoxes || []
+        );
 
         // If page has virtually no text or images (scanned flyer or certificate), take high-res canvas snapshot
-        if (finalPageBlocks.length === 0 && typeof document !== "undefined") {
+        const totalTextChars = pageLines.reduce((acc, l) => acc + l.text.length, 0);
+        const isScannedOrGraphicPage =
+          (finalPageBlocks.length === 0 || (pageLines.length <= 2 && totalTextChars < 50 && pageAssets.images.length === 0)) &&
+          typeof document !== "undefined";
+
+        if (isScannedOrGraphicPage) {
           try {
             const canvas = document.createElement("canvas");
-            const scale = 1.5;
+            const scale = 2.0; // High resolution 2x render
             const scaledViewport = page.getViewport({ scale });
             canvas.width = scaledViewport.width;
             canvas.height = scaledViewport.height;
@@ -1146,14 +1527,17 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
               const pngBytes = new Uint8Array(binStr.length);
               for (let i = 0; i < binStr.length; i++) pngBytes[i] = binStr.charCodeAt(i);
 
+              const fullW = viewport.width || 595.28;
+              const fullH = viewport.height || 841.89;
+
               finalPageBlocks.push({
                 type: "image",
                 data: pngBytes,
                 mimeType: "image/png",
-                width: Math.min(viewport.width, 480),
-                height: (viewport.height / viewport.width) * Math.min(viewport.width, 480),
+                width: fullW - 72,
+                height: ((fullW - 72) / fullW) * fullH,
                 position: "inline",
-                altText: `Page ${p} Visual Layout`,
+                altText: `Page ${p} High-Resolution Layout`,
               });
             }
           } catch (cErr) {
@@ -1162,10 +1546,36 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
         }
 
         const isLandscape = viewport.width > viewport.height;
-        const leftMargin = Math.max(28, Math.min(54, Math.round(pageMinX)));
+
+        // Calculate independent 4-sided page margins from spatial item bounding boxes
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minTopY = Infinity;
+        let maxTopY = -Infinity;
+
+        for (const item of textContent.items || []) {
+          if (!item || typeof item.str !== "string" || !item.str.trim()) continue;
+          const tr = item.transform || [1, 0, 0, 1, 0, 0];
+          const ix = tr[4] || 0;
+          const iy = tr[5] || 0;
+          const itTopY = Math.max(0, viewport.height - iy);
+          const iw = item.width || 10;
+          const ih = Math.abs(item.height) || 10;
+
+          minX = Math.min(minX, ix);
+          maxX = Math.max(maxX, ix + iw);
+          minTopY = Math.min(minTopY, itTopY);
+          maxTopY = Math.max(maxTopY, itTopY + ih);
+        }
+
+        const leftMargin = Number.isFinite(minX) && minX >= 28 ? Math.max(36, Math.min(54, Math.round(minX))) : 54;
+        const rightMargin = Number.isFinite(maxX) && (viewport.width - maxX) >= 28 ? Math.max(36, Math.min(54, Math.round(viewport.width - maxX))) : 54;
+        const topMargin = Number.isFinite(minTopY) && minTopY >= 28 ? Math.max(36, Math.min(54, Math.round(minTopY))) : 54;
+        const bottomMargin = Number.isFinite(maxTopY) && (viewport.height - maxTopY) >= 28 ? Math.max(36, Math.min(54, Math.round(viewport.height - maxTopY))) : 54;
+
         pageSections.push({
           pageSize: { width: viewport.width || 595.28, height: viewport.height || 841.89 },
-          margins: { top: leftMargin, right: leftMargin, bottom: leftMargin, left: leftMargin },
+          margins: { top: topMargin, right: rightMargin, bottom: bottomMargin, left: leftMargin },
           orientation: isLandscape ? "landscape" : "portrait",
           blocks: finalPageBlocks,
         });
