@@ -17,5 +17,6 @@ export * from "./pdf/images";
 export * from "./pdf/security";
 export * from "./pdf/typography";
 export * from "./pdf/text-extractor";
+export * from "./pdf/compress";
 export * from "./document/docx";
 export * from "./document/xlsx";

@@ -15,5 +15,6 @@ export * from "./images";
 export * from "./security";
 export * from "./typography";
 export * from "./text-extractor";
+export * from "./compress";
 export * from "../document/docx";
 export * from "../document/xlsx";

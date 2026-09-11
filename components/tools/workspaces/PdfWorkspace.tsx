@@ -55,6 +55,8 @@ import {
   convertTableOrSpreadsheetToPdf,
   generateRealDocxBlob,
   generateRealXlsxBlob,
+  applyEditedTextToDocumentModel,
+  compressPdfBuffer,
   protectPdfBuffer,
   unlockPdfBuffer,
   PdfEngineError,
@@ -517,7 +519,7 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
 
         const buffer = files[0].arrayBuffer || (await files[0].file.arrayBuffer());
         let docModel = files[0].documentModel;
-        let textContent = extractedWordText;
+        let textContent = extractedWordText || "";
 
         if (!docModel && buffer) {
           const extracted = await extractRealPdfContent(buffer);
@@ -525,16 +527,25 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
           if (!textContent) textContent = extracted.text;
         }
 
-        if (!textContent) textContent = files[0].name;
+        if (!textContent) textContent = files[0].previewText || files[0].name;
 
-        const docxBlob = docModel
-          ? generateRealDocxBlob("Converted Document", docModel)
-          : generateRealDocxBlob("Converted Document", textContent);
+        const isTextEdited =
+          extractedWordText.trim() !== (files[0].previewText || "").trim() &&
+          extractedWordText.trim().length > 0;
+
+        let finalModel: DocumentModel | string = textContent;
+        if (docModel) {
+          finalModel = isTextEdited
+            ? applyEditedTextToDocumentModel(docModel, textContent)
+            : docModel;
+        }
+
+        const docxBlob = generateRealDocxBlob(baseName, finalModel);
 
         const txtBlob = new Blob([textContent], { type: "text/plain;charset=utf-8" });
         setAltTxtBlob(txtBlob);
 
-        const docHtml = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word"><head><meta charset="utf-8"></head><body><h1>${escapeXml(baseName)}</h1><pre>${escapeXml(textContent)}</pre></body></html>`;
+        const docHtml = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word"><head><meta charset="utf-8"></head><body><pre>${escapeXml(textContent)}</pre></body></html>`;
         const docBlob = new Blob([docHtml], { type: "application/msword" });
         setAltDocBlob(docBlob);
 
@@ -598,20 +609,43 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
         setProcessProgress(45);
         await new Promise((r) => setTimeout(r, 300));
 
-        let rawText = extractedWordText;
-        if (!rawText || !rawText.trim()) {
-          rawText = files[0].previewText || `Column 1 | Column 2 | Column 3\nData A | Data B | Data C`;
+        let tableRows: string[][] = [];
+
+        // First extract structured table blocks from docModel if present
+        if (files[0].documentModel?.sections) {
+          for (const sec of files[0].documentModel.sections) {
+            for (const b of sec.blocks || []) {
+              if (b.type === "table") {
+                for (const row of b.rows || []) {
+                  const rData = (row.cells || []).map((c) =>
+                    c.blocks
+                      .map((cb) => (cb.type === "paragraph" ? cb.runs.map((r) => r.text).join("") : ""))
+                      .join(" ")
+                      .trim()
+                  );
+                  if (rData.some((v) => v.length > 0)) tableRows.push(rData);
+                }
+              }
+            }
+          }
         }
 
-        const tableRows: string[][] = rawText
-          .split(/\r?\n/)
-          .filter((l) => l.trim().length > 0)
-          .map((line) => {
-            if (line.includes("|")) return line.split("|").map((c) => c.trim());
-            if (line.includes("\t")) return line.split("\t").map((c) => c.trim());
-            if (line.includes(",")) return line.split(",").map((c) => c.trim());
-            return line.split(/\s{2,}/).map((c) => c.trim());
-          });
+        if (tableRows.length === 0) {
+          let rawText = extractedWordText;
+          if (!rawText || !rawText.trim()) {
+            rawText = files[0].previewText || `Column 1 | Column 2 | Column 3\nData A | Data B | Data C`;
+          }
+
+          tableRows = rawText
+            .split(/\r?\n/)
+            .filter((l) => l.trim().length > 0)
+            .map((line) => {
+              if (line.includes("|")) return line.split("|").map((c) => c.trim()).filter(Boolean);
+              if (line.includes("\t")) return line.split("\t").map((c) => c.trim());
+              if (line.includes(",")) return line.split(",").map((c) => c.trim());
+              return line.split(/\s{2,}/).map((c) => c.trim());
+            });
+        }
 
         const xlsxBlob = generateRealXlsxBlob(baseName, tableRows);
 
@@ -649,22 +683,24 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
         setResultFileSize(pdfBlob.size);
       }
 
-      // 8. COMPRESS PDF
+      // 8. COMPRESS PDF - REAL STREAM OPTIMIZATION & RE-ENCODING
       else if (tool.id === "compress-pdf") {
         setStatusMessage("Optimizing streams and compression dictionaries...");
-        setProcessProgress(60);
-        await new Promise((r) => setTimeout(r, 400));
+        setProcessProgress(20);
 
-        const originalBytes = files[0].size;
-        const reductionRatio =
-          compressionLevel === "extreme" ? 0.38 : compressionLevel === "recommended" ? 0.54 : 0.76;
-        const calculatedSize = Math.max(2048, Math.round(originalBytes * reductionRatio));
+        const buffer = files[0].arrayBuffer || (await files[0].file.arrayBuffer());
+        const compressedBlob = await compressPdfBuffer(
+          buffer,
+          compressionLevel,
+          (msg, pct) => {
+            setStatusMessage(msg);
+            setProcessProgress(pct);
+          }
+        );
 
-        const outBlob = new Blob([files[0].file], { type: "application/pdf" });
-
-        setResultBlob(outBlob);
+        setResultBlob(compressedBlob);
         setResultFileName(`${baseName}-compressed.pdf`);
-        setResultFileSize(calculatedSize);
+        setResultFileSize(compressedBlob.size);
       }
 
       // 9. PROTECT PDF (ISO 32000 STANDARD SECURITY HANDLER ENCRYPTION)
