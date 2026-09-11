@@ -99,6 +99,7 @@ export interface DocxImageBlock {
   width: number; // in pt
   height: number; // in pt
   altText?: string;
+  rotation?: number; // rotation in degrees e.g. 90, 180, 270
 
   // Original PDF position in points.
   // PDF coordinates are converted to top-left coordinates.
@@ -200,10 +201,56 @@ export function coalesceRuns(runs: DocxTextRun[]): DocxTextRun[] {
 }
 
 /**
+ * Parses inline markdown tokens (**bold**, *italic*, ~~strike~~, `code`) into formatted DocxTextRun objects
+ */
+function parseInlineMarkdownRuns(text: string, baseBold: boolean = false): DocxTextRun[] {
+  if (!text) return [{ text: "", bold: baseBold }];
+
+  const runs: DocxTextRun[] = [];
+  const regex = /(\*\*|__)(.*?)\1|(\*|_)(.*?)\3|(~~)(.*?)\5|(`)(.*?)\7/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      runs.push({
+        text: text.substring(lastIndex, match.index),
+        bold: baseBold,
+      });
+    }
+
+    if (match[2] !== undefined) {
+      // Bold **text** or __text__
+      runs.push({ text: match[2], bold: true });
+    } else if (match[4] !== undefined) {
+      // Italic *text* or _text_
+      runs.push({ text: match[4], italic: true, bold: baseBold });
+    } else if (match[6] !== undefined) {
+      // Strike ~~text~~
+      runs.push({ text: match[6], strike: true, bold: baseBold });
+    } else if (match[8] !== undefined) {
+      // Inline code `text`
+      runs.push({ text: match[8], fontFamily: "Consolas", bold: baseBold });
+    }
+
+    lastIndex = regex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    runs.push({
+      text: text.substring(lastIndex),
+      bold: baseBold,
+    });
+  }
+
+  return runs.length > 0 ? runs : [{ text, bold: baseBold }];
+}
+
+/**
  * Parse markdown formatted text into a structured DocumentModel
  */
 export function parseMarkdownToDocumentModel(text: string, title?: string): DocumentModel {
-  const lines = (text || "").split(/\r?\n/);
+  const rawLines = (text || "").split(/\r?\n/);
   const blocks: DocxBlock[] = [];
   let tableRows: DocxTableRow[] = [];
 
@@ -218,7 +265,10 @@ export function parseMarkdownToDocumentModel(text: string, title?: string): Docu
     }
   };
 
-  for (const rawLine of lines) {
+  const isDelimiterRow = (str: string) => /^\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?$/.test(str.trim());
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const rawLine = rawLines[i];
     const line = rawLine.trim();
 
     if (!line) {
@@ -226,17 +276,23 @@ export function parseMarkdownToDocumentModel(text: string, title?: string): Docu
       continue;
     }
 
-    // Markdown Table
-    if (line.includes("|") && (line.startsWith("|") || line.split("|").length >= 2)) {
-      // Check if it is a separator row like |---|---|
-      if (/^\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?$/.test(line)) {
+    // Genuine Markdown Table detection: requires delimiter row in vicinity
+    const isPotentialTableRow = line.startsWith("|") && line.endsWith("|") && line.includes("|");
+    const nextLine = (rawLines[i + 1] || "").trim();
+    const prevLine = (rawLines[i - 1] || "").trim();
+    const isTable =
+      isPotentialTableRow &&
+      (isDelimiterRow(line) || isDelimiterRow(nextLine) || (tableRows.length > 0 && isDelimiterRow(prevLine)));
+
+    if (isTable) {
+      if (isDelimiterRow(line)) {
         continue;
       }
 
-      const rawCells = line.split("|").map((c) => c.trim()).filter((c, idx, arr) => {
-        if ((idx === 0 || idx === arr.length - 1) && c === "" && line.startsWith("|")) return false;
-        return true;
-      });
+      const rawCells = line
+        .slice(1, -1)
+        .split("|")
+        .map((c) => c.trim());
 
       if (rawCells.length > 0) {
         const isHeader = tableRows.length === 0;
@@ -246,7 +302,7 @@ export function parseMarkdownToDocumentModel(text: string, title?: string): Docu
             blocks: [
               {
                 type: "paragraph",
-                runs: [{ text: c, bold: isHeader }],
+                runs: parseInlineMarkdownRuns(c, isHeader),
                 spacingAfter: 0,
               },
             ],
@@ -284,16 +340,18 @@ export function parseMarkdownToDocumentModel(text: string, title?: string): Docu
       blocks.push({
         type: "paragraph",
         isListItem: true,
-        runs: [{ text: bulletText }],
+        leftIndent: 18,
+        hangingIndent: 14,
+        runs: parseInlineMarkdownRuns(bulletText),
         spacingBefore: 1,
         spacingAfter: 3,
       });
     } else {
       blocks.push({
         type: "paragraph",
-        runs: [{ text: rawLine }],
+        runs: parseInlineMarkdownRuns(rawLine),
         spacingBefore: 2,
-        spacingAfter: 5,
+        spacingAfter: 4,
       });
     }
   }
@@ -804,6 +862,7 @@ function parseParagraphXml(
   let firstLineIndent: number | undefined;
   let hangingIndent: number | undefined;
   let pageBreakBefore = false;
+  let frame: DocxFrameSpec | undefined = undefined;
 
   const pPrMatch = pXml.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/);
   if (pPrMatch) {
@@ -839,6 +898,31 @@ function parseParagraphXml(
         headingLevel = 3;
         spacingBefore = 8;
         spacingAfter = 3;
+      }
+    }
+
+    // Frame Positioning (<w:framePr>)
+    const frameMatch = pPr.match(/<w:framePr\b([^>]*)\/>/i);
+    if (frameMatch) {
+      const attrs = frameMatch[1];
+      const wM = attrs.match(/w:w="(\d+)"/i);
+      const hM = attrs.match(/w:h="(\d+)"/i);
+      const xM = attrs.match(/w:x="(\d+)"/i);
+      const yM = attrs.match(/w:y="(\d+)"/i);
+      const hAnchorM = attrs.match(/w:hAnchor="([a-zA-Z]+)"/i);
+      const vAnchorM = attrs.match(/w:vAnchor="([a-zA-Z]+)"/i);
+      const wrapM = attrs.match(/w:wrap="([a-zA-Z]+)"/i);
+
+      if (xM && yM) {
+        frame = {
+          x: Math.round(parseInt(xM[1], 10) / 20),
+          y: Math.round(parseInt(yM[1], 10) / 20),
+          width: wM ? Math.round(parseInt(wM[1], 10) / 20) : undefined,
+          height: hM ? Math.round(parseInt(hM[1], 10) / 20) : undefined,
+          hAnchor: hAnchorM ? (hAnchorM[1].toLowerCase() as any) : "page",
+          vAnchor: vAnchorM ? (vAnchorM[1].toLowerCase() as any) : "page",
+          wrap: wrapM ? (wrapM[1].toLowerCase() as any) : "none",
+        };
       }
     }
 
@@ -1018,6 +1102,7 @@ function parseParagraphXml(
       type: "paragraph",
       runs,
       alignment,
+      frame,
       isHeading,
       headingLevel,
       isListItem,
@@ -1334,7 +1419,17 @@ function buildRunXml(r: DocxTextRun): string {
   rPrParts.push(`<w:sz w:val="${szVal}"/><w:szCs w:val="${szVal}"/>`);
 
   if (r.highlight) {
-    rPrParts.push(`<w:highlight w:val="${escapeXml(r.highlight)}"/>`);
+    const validNamedHighlights = new Set([
+      "yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue",
+      "darkCyan", "darkGreen", "darkMagenta", "darkRed", "darkYellow",
+      "darkGray", "lightGray", "black"
+    ]);
+    const cleanHl = r.highlight.replace("#", "").trim();
+    if (validNamedHighlights.has(r.highlight)) {
+      rPrParts.push(`<w:highlight w:val="${r.highlight}"/>`);
+    } else if (/^[0-9a-fA-F]{6}$/.test(cleanHl)) {
+      rPrParts.push(`<w:shd w:val="clear" w:color="auto" w:fill="${cleanHl.toUpperCase()}"/>`);
+    }
   }
 
   if (r.underline) {
@@ -1411,9 +1506,12 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
     }
   }
 
-  // 4. shd (background shading fill)
+  // 4. shd (background shading fill - light tints only)
   if (block.bgColor) {
-    pPrElements.push(`<w:shd w:val="clear" w:color="auto" w:fill="${block.bgColor.replace('#', '').toUpperCase()}"/>`);
+    const cleanBg = block.bgColor.replace('#', '').toUpperCase();
+    if (cleanBg !== '000000' && cleanBg !== '0' && cleanBg !== 'FFFFFF') {
+      pPrElements.push(`<w:shd w:val="clear" w:color="auto" w:fill="${cleanBg}"/>`);
+    }
   }
 
   // 5. jc (alignment)
@@ -1432,7 +1530,7 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
 
   // 7. spacing (in twips: 1pt = 20 twips) - Tight accurate line spacing without ballooning
   const before = block.spacingBefore !== undefined ? Math.round(block.spacingBefore * 20) : (block.isHeading ? 120 : 0);
-  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 40 : 0);
+  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 40 : (block.isListItem ? 30 : 0));
   let spAttrs = `w:before="${before}" w:after="${after}"`;
   if (block.lineSpacing && block.lineSpacing > 0) {
     spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="auto"`;
@@ -1441,16 +1539,55 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
   }
   pPrElements.push(`<w:spacing ${spAttrs}/>`);
 
-  // 8. ind (indentation)
+  // 8. ind (indentation and list handling)
+  let rawRuns = block.runs || [];
+  let leftIndent = block.leftIndent;
+  let hangingIndent = block.hangingIndent;
+
+  if (block.isListItem) {
+    if (leftIndent === undefined || leftIndent <= 0) leftIndent = 18;
+    if (hangingIndent === undefined || hangingIndent <= 0) hangingIndent = 14;
+
+    if (rawRuns.length > 0) {
+      const firstNonTabIdx = rawRuns.findIndex((r) => !r.tab && r.text);
+      if (firstNonTabIdx >= 0) {
+        const firstRun = rawRuns[firstNonTabIdx];
+        const matchBullet = firstRun.text.match(/^([•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]|\d+[\.\)])\s*/);
+        if (matchBullet) {
+          const bulletMarker = matchBullet[1] || "•";
+          const remainder = firstRun.text.slice(matchBullet[0].length);
+          const newRuns: DocxTextRun[] = [];
+          for (let idx = 0; idx < firstNonTabIdx; idx++) newRuns.push(rawRuns[idx]);
+          newRuns.push({ ...firstRun, text: bulletMarker });
+          newRuns.push({ text: "\t", tab: true });
+          if (remainder) newRuns.push({ ...firstRun, text: remainder });
+          for (let idx = firstNonTabIdx + 1; idx < rawRuns.length; idx++) {
+            if (idx === firstNonTabIdx + 1 && rawRuns[idx].tab) continue;
+            newRuns.push(rawRuns[idx]);
+          }
+          rawRuns = newRuns;
+        } else {
+          const baseFont = firstRun.fontFamily || "Calibri";
+          const baseSz = firstRun.fontSize || 11;
+          rawRuns = [
+            { text: "•", fontFamily: baseFont, fontSize: baseSz, color: firstRun.color },
+            { text: "\t", tab: true },
+            ...rawRuns,
+          ];
+        }
+      }
+    }
+  }
+
   const indParts: string[] = [];
-  if (block.leftIndent !== undefined && block.leftIndent > 0) indParts.push(`w:left="${Math.round(block.leftIndent * 20)}"`);
+  if (leftIndent !== undefined && leftIndent > 0) indParts.push(`w:left="${Math.round(leftIndent * 20)}"`);
   if (block.rightIndent !== undefined && block.rightIndent > 0) indParts.push(`w:right="${Math.round(block.rightIndent * 20)}"`);
   if (block.firstLineIndent !== undefined && block.firstLineIndent > 0) indParts.push(`w:firstLine="${Math.round(block.firstLineIndent * 20)}"`);
-  if (block.hangingIndent !== undefined && block.hangingIndent > 0) indParts.push(`w:hanging="${Math.round(block.hangingIndent * 20)}"`);
+  if (hangingIndent !== undefined && hangingIndent > 0) indParts.push(`w:hanging="${Math.round(hangingIndent * 20)}"`);
   if (indParts.length > 0) pPrElements.push(`<w:ind ${indParts.join(" ")}/>`);
 
   const pPr = pPrElements.length > 0 ? `<w:pPr>${pPrElements.join("")}</w:pPr>` : "";
-  const coalesced = coalesceRuns(block.runs || []);
+  const coalesced = coalesceRuns(rawRuns);
   const runsXml = coalesced.map(buildRunXml).join("");
   return `<w:p>${pPr}${runsXml}</w:p>`;
 }
@@ -1486,6 +1623,7 @@ function buildImageDrawingXml(
 
   const emuWidth = Math.round(ptWidth * 12700);
   const emuHeight = Math.round(ptHeight * 12700);
+  const rotAttr = img.rotation && img.rotation !== 0 ? ` rot="${Math.round(img.rotation * 60000)}"` : "";
 
   const picXml = `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
     <pic:nvPicPr>
@@ -1497,7 +1635,7 @@ function buildImageDrawingXml(
       <a:stretch><a:fillRect/></a:stretch>
     </pic:blipFill>
     <pic:spPr>
-      <a:xfrm>
+      <a:xfrm${rotAttr}>
         <a:off x="0" y="0"/>
         <a:ext cx="${emuWidth}" cy="${emuHeight}"/>
       </a:xfrm>
@@ -1508,10 +1646,11 @@ function buildImageDrawingXml(
   if (isAbsolute) {
     const posX = Math.round((img.x || 0) * 12700);
     const posY = Math.round((img.y || 0) * 12700);
+    const relH = 251658240 + imageCounter;
 
     return `<w:r>
       <w:drawing>
-        <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">
+        <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="${relH}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">
           <wp:simplePos x="0" y="0"/>
           <wp:positionH relativeFrom="page"><wp:posOffset>${posX}</wp:posOffset></wp:positionH>
           <wp:positionV relativeFrom="page"><wp:posOffset>${posY}</wp:posOffset></wp:positionV>
@@ -1605,19 +1744,23 @@ export function applyEditedTextToDocumentModel(
       rawLine = rawLine.replace(/^#+\s*/, "");
     } else if (/^[-*•]\s+/.test(rawLine)) {
       block.isListItem = true;
+      block.leftIndent = block.leftIndent || 18;
+      block.hangingIndent = block.hangingIndent || 14;
       rawLine = rawLine.replace(/^[-*•]\s+/, "");
     }
 
     if (block.runs && block.runs.length > 0) {
       const baseRun = block.runs.find((r) => !r.tab && r.text) || block.runs[0];
-      block.runs = [
-        {
-          ...baseRun,
-          text: rawLine,
-        },
-      ];
+      const parsedRuns = parseInlineMarkdownRuns(rawLine, baseRun.bold);
+      block.runs = parsedRuns.map((r) => ({
+        ...baseRun,
+        ...r,
+        fontFamily: baseRun.fontFamily || "Calibri",
+        fontSize: baseRun.fontSize || 11,
+        color: baseRun.color,
+      }));
     } else {
-      block.runs = [{ text: rawLine, fontFamily: "Calibri", fontSize: 11 }];
+      block.runs = parseInlineMarkdownRuns(rawLine);
     }
   }
 
@@ -1719,27 +1862,27 @@ export function generateRealDocxBlob(
   <w:style w:type="paragraph" w:styleId="Normal" w:default="1">
     <w:name w:val="Normal"/>
     <w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:color w:val="000000"/></w:rPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:color w:val="auto"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading1">
     <w:name w:val="heading 1"/>
     <w:pPr><w:spacing w:before="240" w:after="60"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="32"/><w:szCs w:val="32"/><w:color w:val="000000"/></w:rPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading2">
     <w:name w:val="heading 2"/>
     <w:pPr><w:spacing w:before="180" w:after="40"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="26"/><w:szCs w:val="26"/><w:color w:val="000000"/></w:rPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading3">
     <w:name w:val="heading 3"/>
     <w:pPr><w:spacing w:before="120" w:after="30"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="22"/><w:szCs w:val="22"/><w:color w:val="000000"/></w:rPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="ListBullet">
     <w:name w:val="List Bullet"/>
     <w:pPr><w:ind w:left="720" w:hanging="360"/><w:spacing w:after="20" w:line="240" w:lineRule="auto"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:color w:val="000000"/></w:rPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:color w:val="auto"/></w:rPr>
   </w:style>
   <w:style w:type="table" w:styleId="TableGrid">
     <w:name w:val="Table Grid"/>
@@ -1759,6 +1902,38 @@ export function generateRealDocxBlob(
     typeof contentOrModel === "string"
       ? parseMarkdownToDocumentModel(contentOrModel, title)
       : contentOrModel;
+
+  const usedFonts = new Set<string>();
+  for (const sec of docModel.sections || []) {
+    for (const b of sec.blocks || []) {
+      if (b.type === "paragraph") {
+        for (const r of b.runs || []) {
+          if (r.fontFamily) usedFonts.add(r.fontFamily);
+        }
+      } else if (b.type === "table") {
+        for (const row of b.rows || []) {
+          for (const cell of row.cells || []) {
+            for (const cb of cell.blocks || []) {
+              if (cb.type === "paragraph") {
+                for (const r of cb.runs || []) {
+                  if (r.fontFamily) usedFonts.add(r.fontFamily);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const customFontEntries = Array.from(usedFonts)
+    .filter((f) => f && !fontTableXml.includes(`w:name="${f}"`))
+    .map((f) => `  <w:font w:name="${escapeXml(f)}"><w:family w:val="auto"/><w:pitch w:val="variable"/></w:font>`)
+    .join("\n");
+
+  const dynamicFontTableXml = customFontEntries
+    ? fontTableXml.replace("</w:fonts>", `${customFontEntries}\n</w:fonts>`)
+    : fontTableXml;
 
   const bodyXmlParts: string[] = [];
   let imageCounter = 0;
@@ -1948,7 +2123,7 @@ export function generateRealDocxBlob(
     { name: "word/_rels/document.xml.rels", data: encoder.encode(wordRelsXml) },
     { name: "word/styles.xml", data: encoder.encode(stylesXml) },
     { name: "word/settings.xml", data: encoder.encode(settingsXml) },
-    { name: "word/fontTable.xml", data: encoder.encode(fontTableXml) },
+    { name: "word/fontTable.xml", data: encoder.encode(dynamicFontTableXml) },
     { name: "word/document.xml", data: encoder.encode(documentXml) },
     ...imageEntries,
   ];

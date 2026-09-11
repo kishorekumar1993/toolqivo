@@ -408,16 +408,19 @@ function clusterTextItemsIntoLines(
     const isBold = /bold|black|heavy|semibold|medium|700|800|900|demi/i.test(combinedFont);
     const isItalic = /italic|oblique|slanted|inclined/i.test(combinedFont);
 
-    // Accurate 2D spatial text color matching (eliminates 1:1 index mismatch bug)
+    // Accurate 2D spatial text color matching (tight on-line tolerance)
     let color: string | undefined = undefined;
-    let minDist = 45;
+    let minDist = 30;
     for (const sc of spatialColors) {
       const dy = Math.abs(sc.topY - topY);
-      if (dy <= 8) {
+      if (dy <= Math.max(3.5, fontSize * 0.35)) {
         const dx = Math.abs(sc.x - x);
-        if (dx < minDist) {
-          minDist = dx;
-          color = sc.color;
+        if (dx <= 35) {
+          const dist = Math.sqrt(dx * dx + dy * dy * 4);
+          if (dist < minDist) {
+            minDist = dist;
+            color = sc.color;
+          }
         }
       }
     }
@@ -714,12 +717,65 @@ function buildRunsAndTabsFromItems(
 ): { runs: DocxTextRun[]; tabs: { val: "left" | "center" | "right"; pos: number }[] } {
   const runs: DocxTextRun[] = [];
   const tabs: { val: "left" | "center" | "right"; pos: number }[] = [];
+  if (!items || items.length === 0) return { runs, tabs };
+
+  const firstStr = (items[0]?.str || "").trim();
+  const isStandaloneBullet = /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]$/.test(firstStr);
+  const startsWithBullet = /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]\s+/.test(items[0]?.str || "");
+
+  let startIdx = 0;
+
+  if (isStandaloneBullet) {
+    const it = items[0];
+    const rawColor = it.color && it.color !== "000000" ? it.color : defaultColor;
+    const cleanColor = rawColor ? rawColor.replace("#", "").toUpperCase() : undefined;
+    runs.push({
+      text: "•",
+      bold: it.isBold,
+      italic: it.isItalic,
+      fontSize: it.fontSize,
+      fontFamily: it.fontFamily,
+      color: cleanColor,
+    });
+    runs.push({ text: "\t", tab: true });
+    startIdx = 1;
+  } else if (startsWithBullet) {
+    const it = items[0];
+    const rawColor = it.color && it.color !== "000000" ? it.color : defaultColor;
+    const cleanColor = rawColor ? rawColor.replace("#", "").toUpperCase() : undefined;
+    runs.push({
+      text: "•",
+      bold: it.isBold,
+      italic: it.isItalic,
+      fontSize: it.fontSize,
+      fontFamily: it.fontFamily,
+      color: cleanColor,
+    });
+    runs.push({ text: "\t", tab: true });
+    const remainder = it.str.replace(/^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]\s*/, "");
+    if (remainder) {
+      runs.push({
+        text: remainder,
+        bold: it.isBold,
+        italic: it.isItalic,
+        underline: it.isUnderline,
+        fontSize: it.fontSize,
+        fontFamily: it.fontFamily,
+        color: cleanColor,
+      });
+    }
+    startIdx = 1;
+  }
+
   let lastX = -1;
   let lastW = 0;
 
-  for (let i = 0; i < items.length; i++) {
+  for (let i = startIdx; i < items.length; i++) {
     const it = items[i];
     let str = it.str;
+    if (startIdx === 1 && i === 1 && isStandaloneBullet) {
+      str = str.replace(/^\s+/, "");
+    }
     if (lastX >= 0) {
       const gap = it.x - (lastX + lastW);
       if (gap >= 18.0 && it.x > 70) {
@@ -905,8 +961,17 @@ function reconstructPageBlocks(
         line.topY <= box.topY + box.height + 4;
 
       if (isContained && box.bgColor) {
-        bgColor = box.bgColor.replace("#", "").toUpperCase();
-        break;
+        const clean = box.bgColor.replace("#", "").toUpperCase();
+        if (clean !== "000000" && clean !== "0" && clean !== "FFFFFF") {
+          const r = parseInt(clean.substring(0, 2), 16) || 0;
+          const g = parseInt(clean.substring(2, 4), 16) || 0;
+          const b = parseInt(clean.substring(4, 6), 16) || 0;
+          const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+          if (lum >= 0.78) {
+            bgColor = clean;
+            break;
+          }
+        }
       }
     }
 
@@ -914,6 +979,11 @@ function reconstructPageBlocks(
       bottomBorder ? { bottom: bottomBorder } : undefined;
 
     const fallbackColor = line.color && line.color !== "000000" ? line.color.replace("#", "").toUpperCase() : undefined;
+
+    const calcLeftIndent = line.isListItem
+      ? (line.leftIndent && line.leftIndent > 25 ? Math.max(36, line.leftIndent + 14) : 18)
+      : (line.alignment === "left" && line.leftIndent !== undefined && line.leftIndent > 3 ? line.leftIndent : undefined);
+    const calcHangingIndent = line.isListItem ? 14 : undefined;
 
     elements.push({
       topY: line.topY,
@@ -934,7 +1004,8 @@ function reconstructPageBlocks(
               },
             ],
         alignment: line.alignment,
-        leftIndent: line.alignment === "left" && line.leftIndent !== undefined && line.leftIndent > 3 ? line.leftIndent : undefined,
+        leftIndent: calcLeftIndent,
+        hangingIndent: calcHangingIndent,
         tabs: tabs.length > 0 ? tabs : undefined,
         isHeading: line.isHeading,
         headingLevel: line.headingLevel,
@@ -1065,8 +1136,15 @@ async function extractImagesAndColorsFromPdfJsPage(
     const addFilledBox = (x: number, topY: number, width: number, height: number, bgColor: string) => {
       if (!bgColor) return;
       const cleanHex = bgColor.replace("#", "").toUpperCase().trim();
-      // Ignore pure white, 0-length or invalid hex codes
-      if (cleanHex === "FFFFFF" || cleanHex === "FFF" || cleanHex.length !== 6) return;
+      // Ignore pure black, pure white, 0-length or invalid hex codes
+      if (cleanHex === "000000" || cleanHex === "0" || cleanHex === "FFFFFF" || cleanHex === "FFF" || cleanHex.length !== 6) return;
+
+      const r = parseInt(cleanHex.substring(0, 2), 16) || 0;
+      const g = parseInt(cleanHex.substring(2, 4), 16) || 0;
+      const b = parseInt(cleanHex.substring(4, 6), 16) || 0;
+      const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+      // Exclude dark clipping/mask frames and dark boxes (require light pastel tint lum >= 0.78)
+      if (lum < 0.78) return;
 
       // Ignore whole-page canvas background covers (>= 95% of page dimensions)
       const isFullPageCover = width >= viewport.width * 0.95 && height >= viewport.height * 0.95;
@@ -1090,10 +1168,15 @@ async function extractImagesAndColorsFromPdfJsPage(
     const SET_STROKE_COLOR_N = pdfjs?.OPS?.setStrokeColorN ?? 20;
     const SET_STROKE_GRAY = pdfjs?.OPS?.setStrokeGray ?? 4;
     const SET_STROKE_CMYK = pdfjs?.OPS?.setStrokeCMYKColor ?? 9;
+    const SET_TEXT_MATRIX = pdfjs?.OPS?.setTextMatrix ?? 27;
+    const MOVE_TEXT = pdfjs?.OPS?.moveText ?? 28;
+    const NEXT_LINE = pdfjs?.OPS?.nextLine ?? 30;
     const SHOW_TEXT = pdfjs?.OPS?.showText ?? 33;
     const SHOW_SPACED_TEXT = pdfjs?.OPS?.showSpacedText ?? 34;
     const CONSTRUCT_PATH = pdfjs?.OPS?.constructPath ?? 91;
     const RECTANGLE_OP = pdfjs?.OPS?.rectangle ?? 19;
+
+    let currentTextMatrix = [1, 0, 0, 1, 0, 0];
 
     for (let i = 0; i < fnArray.length; i++) {
       const fn = fnArray[i];
@@ -1119,6 +1202,22 @@ async function extractImagesAndColorsFromPdfJsPage(
         continue;
       }
 
+      // Text Matrix tracking
+      if (fn === SET_TEXT_MATRIX && args?.length >= 6) {
+        currentTextMatrix = [...args];
+        continue;
+      }
+
+      if (fn === MOVE_TEXT && args?.length >= 2) {
+        currentTextMatrix = multiplyMatrices(currentTextMatrix, [1, 0, 0, 1, args[0] || 0, args[1] || 0]);
+        continue;
+      }
+
+      if (fn === NEXT_LINE) {
+        currentTextMatrix = multiplyMatrices(currentTextMatrix, [1, 0, 0, 1, 0, -12]);
+        continue;
+      }
+
       // Color tracking
       if (fn === SET_FILL_RGB || fn === SET_FILL_COLOR || fn === SET_FILL_COLOR_N || fn === SET_FILL_GRAY || fn === SET_FILL_CMYK) {
         const hex = parseColorToHex(args);
@@ -1136,7 +1235,8 @@ async function extractImagesAndColorsFromPdfJsPage(
       if (fn === SHOW_TEXT || fn === SHOW_SPACED_TEXT) {
         const col = currentFillColor || currentStrokeColor;
         if (col && col !== "000000") {
-          const [tx, ty] = transformPoint(currentTransform, 0, 0);
+          const combinedMatrix = multiplyMatrices(currentTransform, currentTextMatrix);
+          const [tx, ty] = transformPoint(combinedMatrix, 0, 0);
           spatialColors.push({
             x: tx,
             topY: Math.max(0, viewport.height - ty),
