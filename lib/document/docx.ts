@@ -251,18 +251,21 @@ export interface ExtractedDocxPackage {
 }
 
 /**
- * Universal media file resolver handling relative paths, prefixes and bare names
+ * Universal media file resolver handling relative paths, prefixes, bare names, and case-insensitivity
  */
 export function resolveMediaFile(
   target: string,
   mediaFiles: Map<string, Uint8Array>
 ): Uint8Array | undefined {
-  if (!target) return undefined;
+  if (!target || mediaFiles.size === 0) {
+    if (mediaFiles.size === 1) return mediaFiles.values().next().value;
+    return undefined;
+  }
 
   const normalized = target
     .replace(/\\/g, "/")
     .replace(/^\/+/, "")
-    .replace(/^word\//, "")
+    .replace(/^word\//i, "")
     .replace(/^(\.\.\/)+/, "");
 
   const candidates = [
@@ -282,6 +285,23 @@ export function resolveMediaFile(
   for (const key of candidates) {
     const data = mediaFiles.get(key);
     if (data) return data;
+  }
+
+  // Case-insensitive fallback
+  const lowerCandidates = candidates.map((c) => c.toLowerCase());
+  for (const [mapKey, data] of mediaFiles.entries()) {
+    const lowerMapKey = mapKey.toLowerCase();
+    if (
+      lowerCandidates.includes(lowerMapKey) ||
+      (fileName && lowerMapKey.endsWith(fileName.toLowerCase()))
+    ) {
+      return data;
+    }
+  }
+
+  // Single-image fallback
+  if (mediaFiles.size === 1) {
+    return mediaFiles.values().next().value;
   }
 
   return undefined;
@@ -1171,7 +1191,10 @@ export function generateRealDocxBlob(
                 rPrParts.push(`<w:color w:val="${hex}"/>`);
               }
               const rPr = rPrParts.length > 0 ? `<w:rPr>${rPrParts.join("")}</w:rPr>` : "";
-              return `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(r.text)}</w:t></w:r>`;
+              const textContent = r.text.includes("\n")
+                ? r.text.split("\n").map((part) => `<w:t xml:space="preserve">${escapeXml(part)}</w:t>`).join("<w:br/>")
+                : `<w:t xml:space="preserve">${escapeXml(r.text)}</w:t>`;
+              return `<w:r>${rPr}${textContent}</w:r>`;
             })
             .join("");
 
@@ -1211,7 +1234,10 @@ export function generateRealDocxBlob(
                           if (r.fontSize) rPrParts.push(`<w:sz w:val="${Math.round(r.fontSize * 2)}"/>`);
                           if (r.color) rPrParts.push(`<w:color w:val="${r.color.replace("#", "")}"/>`);
                           const rPr = rPrParts.length > 0 ? `<w:rPr>${rPrParts.join("")}</w:rPr>` : "";
-                          return `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(r.text)}</w:t></w:r>`;
+                          const textContent = r.text.includes("\n")
+                            ? r.text.split("\n").map((part) => `<w:t xml:space="preserve">${escapeXml(part)}</w:t>`).join("<w:br/>")
+                            : `<w:t xml:space="preserve">${escapeXml(r.text)}</w:t>`;
+                          return `<w:r>${rPr}${textContent}</w:r>`;
                         })
                         .join("");
                       return `<w:p><w:pPr><w:spacing w:after="0"/></w:pPr>${runs}</w:p>`;

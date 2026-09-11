@@ -125,11 +125,12 @@ interface RichTextToken {
   subscript?: boolean;
   highlight?: string;
   isSpace: boolean;
+  isNewline?: boolean;
   width: number;
 }
 
 /**
- * Split paragraph runs into styled word and whitespace tokens with long-word safety
+ * Split paragraph runs into styled word and whitespace tokens with newline and long-word safety
  */
 function tokenizeParagraphRuns(
   runs: DocxTextRun[],
@@ -171,35 +172,72 @@ function tokenizeParagraphRuns(
       isHeading ? { r: 0.06, g: 0.09, b: 0.16 } : { r: 0.12, g: 0.16, b: 0.23 }
     );
 
-    // Split run into words and spaces preserving whitespace
-    const parts = rawText.split(/(\s+)/);
-    for (const part of parts) {
-      if (!part) continue;
-      const isSpace = /^\s+$/.test(part);
-      if (isSpace) {
-        const width = safeMeasureText(font, " ", fontSize);
+    // Split run by newlines first, then spaces
+    const lineParts = rawText.split(/\r?\n/);
+    for (let l = 0; l < lineParts.length; l++) {
+      if (l > 0) {
         tokens.push({
-          text: " ",
+          text: "",
           font,
           fontSize,
           color,
-          underline: run.underline,
-          strike: run.strike,
-          superscript: run.superscript,
-          subscript: run.subscript,
-          highlight: run.highlight,
-          isSpace: true,
-          width,
+          isSpace: false,
+          isNewline: true,
+          width: 0,
         });
-      } else {
-        const fullW = safeMeasureText(font, part, fontSize);
-        if (fullW > maxAvailableWidth && maxAvailableWidth > 50) {
-          // Word is wider than entire content area: split into character sub-tokens
-          let currentChunk = "";
-          for (let i = 0; i < part.length; i++) {
-            const testChunk = currentChunk + part[i];
-            const testW = safeMeasureText(font, testChunk, fontSize);
-            if (testW > maxAvailableWidth && currentChunk.length > 0) {
+      }
+
+      const linePart = lineParts[l];
+      if (!linePart) continue;
+
+      const parts = linePart.split(/(\s+)/);
+      for (const part of parts) {
+        if (!part) continue;
+        const isSpace = /^\s+$/.test(part);
+        if (isSpace) {
+          const width = safeMeasureText(font, " ", fontSize);
+          tokens.push({
+            text: " ",
+            font,
+            fontSize,
+            color,
+            underline: run.underline,
+            strike: run.strike,
+            superscript: run.superscript,
+            subscript: run.subscript,
+            highlight: run.highlight,
+            isSpace: true,
+            width,
+          });
+        } else {
+          const fullW = safeMeasureText(font, part, fontSize);
+          if (fullW > maxAvailableWidth && maxAvailableWidth > 50) {
+            // Word is wider than entire content area: split into character sub-tokens
+            let currentChunk = "";
+            for (let i = 0; i < part.length; i++) {
+              const testChunk = currentChunk + part[i];
+              const testW = safeMeasureText(font, testChunk, fontSize);
+              if (testW > maxAvailableWidth && currentChunk.length > 0) {
+                const chunkW = safeMeasureText(font, currentChunk, fontSize);
+                tokens.push({
+                  text: currentChunk,
+                  font,
+                  fontSize,
+                  color,
+                  underline: run.underline,
+                  strike: run.strike,
+                  superscript: run.superscript,
+                  subscript: run.subscript,
+                  highlight: run.highlight,
+                  isSpace: false,
+                  width: chunkW,
+                });
+                currentChunk = part[i];
+              } else {
+                currentChunk = testChunk;
+              }
+            }
+            if (currentChunk.length > 0) {
               const chunkW = safeMeasureText(font, currentChunk, fontSize);
               tokens.push({
                 text: currentChunk,
@@ -214,15 +252,10 @@ function tokenizeParagraphRuns(
                 isSpace: false,
                 width: chunkW,
               });
-              currentChunk = part[i];
-            } else {
-              currentChunk = testChunk;
             }
-          }
-          if (currentChunk.length > 0) {
-            const chunkW = safeMeasureText(font, currentChunk, fontSize);
+          } else {
             tokens.push({
-              text: currentChunk,
+              text: part,
               font,
               fontSize,
               color,
@@ -232,29 +265,69 @@ function tokenizeParagraphRuns(
               subscript: run.subscript,
               highlight: run.highlight,
               isSpace: false,
-              width: chunkW,
+              width: fullW,
             });
           }
-        } else {
-          tokens.push({
-            text: part,
-            font,
-            fontSize,
-            color,
-            underline: run.underline,
-            strike: run.strike,
-            superscript: run.superscript,
-            subscript: run.subscript,
-            highlight: run.highlight,
-            isSpace: false,
-            width: fullW,
-          });
         }
       }
     }
   }
 
   return tokens;
+}
+
+/**
+ * Robust image embedding with canvas fallback for any unsupported format (EMF, WebP, GIF, etc.)
+ */
+async function safelyEmbedImageInPdf(pdfDoc: any, imgBytes: Uint8Array, mimeType?: string): Promise<any> {
+  const isPng = mimeType === "image/png" || imgBytes[0] === 0x89;
+  try {
+    if (isPng) {
+      return await pdfDoc.embedPng(imgBytes);
+    } else {
+      return await pdfDoc.embedJpg(imgBytes);
+    }
+  } catch {
+    try {
+      if (!isPng) {
+        return await pdfDoc.embedPng(imgBytes);
+      } else {
+        return await pdfDoc.embedJpg(imgBytes);
+      }
+    } catch {
+      // Browser Canvas fallback to re-encode into clean 100% valid PNG
+      if (typeof document !== "undefined") {
+        try {
+          const blob = new Blob([imgBytes as BlobPart]);
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.src = url;
+          await new Promise<void>((resolve, reject) => {
+            img.onload = () => resolve();
+            img.onerror = reject;
+            setTimeout(() => reject(new Error("Image load timeout")), 2000);
+          });
+          const canvas = document.createElement("canvas");
+          canvas.width = img.naturalWidth || img.width || 200;
+          canvas.height = img.naturalHeight || img.height || 200;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(img, 0, 0);
+            URL.revokeObjectURL(url);
+            const dataUrl = canvas.toDataURL("image/png");
+            const base64 = dataUrl.split(",")[1];
+            const binStr = atob(base64);
+            const cleanPngBytes = new Uint8Array(binStr.length);
+            for (let b = 0; b < binStr.length; b++) cleanPngBytes[b] = binStr.charCodeAt(b);
+            return await pdfDoc.embedPng(cleanPngBytes);
+          }
+        } catch (canvasErr) {
+          console.warn("Canvas image fallback warning:", canvasErr);
+        }
+      }
+      throw new Error("Unable to embed image in PDF");
+    }
+  }
 }
 
 /**
@@ -391,6 +464,19 @@ export async function convertDocumentModelToPdf(
         let curLineMaxFontSize = defaultFontSize;
 
         for (const token of tokens) {
+          if (token.isNewline) {
+            // Force line break immediately
+            while (curLineTokens.length > 0 && curLineTokens[curLineTokens.length - 1].isSpace) {
+              const removed = curLineTokens.pop()!;
+              curLineWidth -= removed.width;
+            }
+            lines.push({ tokens: curLineTokens, lineWidth: curLineWidth, maxFontSize: curLineMaxFontSize });
+            curLineTokens = [];
+            curLineWidth = 0;
+            curLineMaxFontSize = defaultFontSize;
+            continue;
+          }
+
           if (curLineTokens.length === 0 && token.isSpace) {
             continue; // Skip leading whitespace
           }
@@ -652,10 +738,7 @@ export async function convertDocumentModelToPdf(
       } else if (block.type === "image") {
         try {
           const imgBlock = block as DocxImageBlock;
-          const isPng = imgBlock.mimeType === "image/png" || imgBlock.data[0] === 0x89;
-          const embeddedImg = isPng
-            ? await pdfDoc.embedPng(imgBlock.data)
-            : await pdfDoc.embedJpg(imgBlock.data);
+          const embeddedImg = await safelyEmbedImageInPdf(pdfDoc, imgBlock.data, imgBlock.mimeType);
 
           let imgW = imgBlock.width || 380;
           let imgH = imgBlock.height || 240;
