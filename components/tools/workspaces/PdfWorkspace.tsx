@@ -47,9 +47,13 @@ import {
   RenderedJpgPage,
   SplitPageItem,
   extractTextFromDocx,
+  parseDocxToDocumentModel,
+  extractRealPdfContent,
   convertTextOrWordToPdf,
+  convertDocumentModelToPdf,
   extractTableFromXlsx,
   convertTableOrSpreadsheetToPdf,
+  generateRealDocxBlob,
   generateRealXlsxBlob,
   protectPdfBuffer,
   unlockPdfBuffer,
@@ -59,6 +63,10 @@ import {
   IncorrectPasswordError,
   FileTooLargeError,
   PageLimitExceededError,
+  DocumentModel,
+  escapeXml,
+  buildZip,
+  ZipEntry,
 } from "@/lib/pdf-engine";
 
 interface PdfWorkspaceProps {
@@ -73,251 +81,7 @@ interface UploadedPdfItem {
   pageCount?: number;
   previewText?: string;
   arrayBuffer?: ArrayBuffer;
-}
-
-
-
-// ==========================================
-// 100% Genuine OpenXML PKZip .DOCX Generator
-// ==========================================
-
-const makeCrcTable = () => {
-  let c;
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[n] = c;
-  }
-  return table;
-};
-
-interface ZipEntry {
-  name: string;
-  data: Uint8Array;
-}
-
-function buildZip(entries: ZipEntry[]): Uint8Array {
-  const crcTable = makeCrcTable();
-  const getCrc = (buf: Uint8Array) => {
-    let crc = 0 ^ -1;
-    for (let i = 0; i < buf.length; i++) {
-      crc = (crc >>> 8) ^ crcTable[(crc ^ buf[i]) & 0xff];
-    }
-    return (crc ^ -1) >>> 0;
-  };
-
-  const localHeaders: Uint8Array[] = [];
-  const centralHeaders: Uint8Array[] = [];
-  let offset = 0;
-
-  for (const entry of entries) {
-    const nameBytes = new TextEncoder().encode(entry.name);
-    const crc = getCrc(entry.data);
-    const size = entry.data.length;
-
-    const lh = new Uint8Array(30 + nameBytes.length + size);
-    const lView = new DataView(lh.buffer);
-    lView.setUint32(0, 0x04034b50, true);
-    lView.setUint16(4, 20, true);
-    lView.setUint16(6, 0, true);
-    lView.setUint16(8, 0, true);
-    lView.setUint16(10, 0, true);
-    lView.setUint16(12, 0, true);
-    lView.setUint32(14, crc, true);
-    lView.setUint32(18, size, true);
-    lView.setUint32(22, size, true);
-    lView.setUint16(26, nameBytes.length, true);
-    lView.setUint16(28, 0, true);
-    lh.set(nameBytes, 30);
-    lh.set(entry.data, 30 + nameBytes.length);
-    localHeaders.push(lh);
-
-    const ch = new Uint8Array(46 + nameBytes.length);
-    const cView = new DataView(ch.buffer);
-    cView.setUint32(0, 0x02014b50, true);
-    cView.setUint16(4, 20, true);
-    cView.setUint16(6, 20, true);
-    cView.setUint16(8, 0, true);
-    cView.setUint16(10, 0, true);
-    cView.setUint16(12, 0, true);
-    cView.setUint16(14, 0, true);
-    cView.setUint32(16, crc, true);
-    cView.setUint32(20, size, true);
-    cView.setUint32(24, size, true);
-    cView.setUint16(28, nameBytes.length, true);
-    cView.setUint16(30, 0, true);
-    cView.setUint16(32, 0, true);
-    cView.setUint16(34, 0, true);
-    cView.setUint16(36, 0, true);
-    cView.setUint32(38, 0, true);
-    cView.setUint32(42, offset, true);
-    ch.set(nameBytes, 46);
-    centralHeaders.push(ch);
-
-    offset += lh.length;
-  }
-
-  const centralDirOffset = offset;
-  const centralDirSize = centralHeaders.reduce((acc, h) => acc + h.length, 0);
-
-  const eocd = new Uint8Array(22);
-  const eView = new DataView(eocd.buffer);
-  eView.setUint32(0, 0x06054b50, true);
-  eView.setUint16(4, 0, true);
-  eView.setUint16(6, 0, true);
-  eView.setUint16(8, entries.length, true);
-  eView.setUint16(10, entries.length, true);
-  eView.setUint32(12, centralDirSize, true);
-  eView.setUint32(16, centralDirOffset, true);
-  eView.setUint16(20, 0, true);
-
-  const totalLength = offset + centralDirSize + 22;
-  const result = new Uint8Array(totalLength);
-  let pos = 0;
-  for (const lh of localHeaders) {
-    result.set(lh, pos);
-    pos += lh.length;
-  }
-  for (const ch of centralHeaders) {
-    result.set(ch, pos);
-    pos += ch.length;
-  }
-  result.set(eocd, pos);
-
-  return result;
-}
-
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function generateRealDocxBlob(title: string, textContent: string): Blob {
-  const encoder = new TextEncoder();
-
-  const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
-</Types>`;
-
-  const relsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>`;
-
-  const wordRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-</Relationships>`;
-
-  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:docDefaults>
-    <w:rPrDefault>
-      <w:rPr>
-        <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>
-        <w:sz w:val="22"/>
-        <w:szCs w:val="22"/>
-        <w:lang w:val="en-US"/>
-      </w:rPr>
-    </w:rPrDefault>
-  </w:docDefaults>
-</w:styles>`;
-
-  const paragraphs = textContent
-    .split("\n")
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        return `<w:p><w:pPr><w:spacing w:after="120"/></w:pPr></w:p>`;
-      }
-      return `<w:p>
-        <w:pPr>
-          <w:spacing w:after="140" w:line="260" w:lineRule="auto"/>
-        </w:pPr>
-        <w:r>
-          <w:rPr>
-            <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>
-            <w:sz w:val="22"/>
-            <w:color w:val="1E293B"/>
-          </w:rPr>
-          <w:t xml:space="preserve">${escapeXml(line)}</w:t>
-        </w:r>
-      </w:p>`;
-    })
-    .join("");
-
-  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>
-    <w:p>
-      <w:pPr>
-        <w:spacing w:after="200"/>
-      </w:pPr>
-      <w:r>
-        <w:rPr>
-          <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>
-          <w:b/>
-          <w:sz w:val="36"/>
-          <w:color w:val="0F172A"/>
-        </w:rPr>
-        <w:t>${escapeXml(title)}</w:t>
-      </w:r>
-    </w:p>
-    ${paragraphs}
-    <w:sectPr>
-      <w:pgSz w:w="12240" w:h="15840"/>
-      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>
-    </w:sectPr>
-  </w:body>
-</w:document>`;
-
-  const entries: ZipEntry[] = [
-    { name: "[Content_Types].xml", data: encoder.encode(contentTypesXml) },
-    { name: "_rels/.rels", data: encoder.encode(relsXml) },
-    { name: "word/_rels/document.xml.rels", data: encoder.encode(wordRelsXml) },
-    { name: "word/styles.xml", data: encoder.encode(stylesXml) },
-    { name: "word/document.xml", data: encoder.encode(documentXml) },
-  ];
-
-  const zipBytes = buildZip(entries);
-  return new Blob([new Uint8Array(zipBytes)], {
-    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  });
-}
-
-function generateRealExcelBlob(title: string, content: string): Blob {
-  const lines = content.split("\n").filter((l) => l.trim().length > 0);
-  const rows = lines
-    .map((line) => {
-      const cols = line.split(/[|,\t]/).map((c) => c.trim());
-      return `<Row>${cols.map((col) => `<Cell><Data ss:Type="String">${escapeXml(col)}</Data></Cell>`).join("")}</Row>`;
-    })
-    .join("");
-
-  const xml = `<?xml version="1.0"?>
-<?mso-application progid="Excel.Sheet"?>
-<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
- xmlns:o="urn:schemas-microsoft-com:office:office"
- xmlns:x="urn:schemas-microsoft-com:office:excel"
- xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
- <Worksheet ss:Name="Sheet1">
-  <Table>
-   ${rows || `<Row><Cell><Data ss:Type="String">${escapeXml(title)}</Data></Cell></Row>`}
-  </Table>
- </Worksheet>
-</Workbook>`;
-  return new Blob([xml], { type: "application/vnd.ms-excel" });
+  documentModel?: DocumentModel;
 }
 
 export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
@@ -377,61 +141,6 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
     addFiles(Array.from(e.dataTransfer.files));
   };
 
-  const extractRealPdfContent = async (buffer: ArrayBuffer): Promise<{ text: string; pageCount: number }> => {
-    try {
-      const pdfjs = await getPdfJs();
-      if (pdfjs) {
-        const clonedBuffer = buffer.slice(0);
-        const loadingTask = pdfjs.getDocument({ data: new Uint8Array(clonedBuffer) });
-        const pdfDoc = await loadingTask.promise;
-        const numPages = pdfDoc.numPages;
-        const pageTexts: string[] = [];
-
-        for (let p = 1; p <= numPages; p++) {
-          const page = await pdfDoc.getPage(p);
-          const textContent = await page.getTextContent();
-          
-          let lastY: number | null = null;
-          let line = "";
-          const lines: string[] = [];
-
-          for (const item of textContent.items as any[]) {
-            const y = Math.round(item.transform[5]);
-            if (lastY !== null && Math.abs(y - lastY) > 6) {
-              if (line.trim()) lines.push(line.trim());
-              line = "";
-            }
-            line += (item.str || "") + " ";
-            lastY = y;
-          }
-          if (line.trim()) lines.push(line.trim());
-
-          const fullPage = lines.join("\n");
-          if (fullPage.trim()) {
-            pageTexts.push(fullPage.trim());
-          }
-        }
-
-        if (pageTexts.length > 0) {
-          return { text: pageTexts.join("\n\n"), pageCount: numPages };
-        }
-        return { text: "", pageCount: numPages };
-      }
-    } catch (err) {
-      console.warn("PDF.js extraction:", err);
-    }
-
-    try {
-      const bytes = new Uint8Array(buffer);
-      const text = new TextDecoder("latin1").decode(bytes);
-      const pageMatches = text.match(/\/Type\s*\/Page[^s]/g);
-      const pageCount = pageMatches ? pageMatches.length : 1;
-      return { text: "", pageCount };
-    } catch {
-      return { text: "", pageCount: 1 };
-    }
-  };
-
   const addFiles = async (newFiles: File[]) => {
     setIsExtractingText(true);
     let validFiles = newFiles;
@@ -452,6 +161,8 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
         let pageCount = 1;
         let previewText = "";
 
+        let documentModel: DocumentModel | undefined;
+
         try {
           arrayBuffer = await f.arrayBuffer();
           if (f.type.includes("pdf") || f.name.toLowerCase().endsWith(".pdf")) {
@@ -462,14 +173,17 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
               pageCount = extracted.pageCount;
             }
             previewText = extracted.text;
+            documentModel = extracted.model;
           } else if (
             f.name.toLowerCase().endsWith(".docx") ||
             f.name.toLowerCase().endsWith(".doc") ||
             f.type.includes("word") ||
             f.type.includes("officedocument.wordprocessingml")
           ) {
+            const docModel = await parseDocxToDocumentModel(arrayBuffer);
             const docxText = await extractTextFromDocx(arrayBuffer);
             previewText = docxText;
+            documentModel = docModel;
             pageCount = Math.max(1, Math.ceil(docxText.split("\n").filter(Boolean).length / 30));
           } else if (
             f.name.toLowerCase().endsWith(".xlsx") ||
@@ -496,6 +210,7 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
           pageCount,
           previewText,
           arrayBuffer,
+          documentModel,
         };
       })
     );
@@ -749,27 +464,40 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
 
       // 5. WORD TO PDF (.DOC / .DOCX to .PDF)
       else if (tool.id === "word-to-pdf") {
-        setStatusMessage("Reading Word document and parsing typography...");
+        setStatusMessage("Parsing Word typography, styles, tables, and document layout...");
         setProcessProgress(25);
 
-        let content = extractedWordText;
-        if (!content || !content.trim()) {
-          const buffer = files[0].arrayBuffer || (await files[0].file.arrayBuffer());
-          content = await extractTextFromDocx(buffer);
+        let docModel = files[0].documentModel;
+        const buffer = files[0].arrayBuffer || (await files[0].file.arrayBuffer());
+        if (!docModel && buffer) {
+          docModel = await parseDocxToDocumentModel(buffer);
         }
 
-        if (!content || !content.trim()) {
-          content = `Document Content: ${baseName}\n\nConverted from Word document (${files[0].name}).`;
-        }
-
-        const pdfBlob = await convertTextOrWordToPdf(
-          content,
-          baseName,
-          (msg, pct) => {
-            setStatusMessage(msg);
-            setProcessProgress(pct);
+        let pdfBlob: Blob;
+        if (docModel && docModel.sections.some((s) => s.blocks.length > 0)) {
+          pdfBlob = await convertDocumentModelToPdf(
+            docModel,
+            baseName,
+            (msg, pct) => {
+              setStatusMessage(msg);
+              setProcessProgress(pct);
+            }
+          );
+        } else {
+          let content = extractedWordText || (buffer ? await extractTextFromDocx(buffer) : "");
+          if (!content || !content.trim()) {
+            content = `Document Content: ${baseName}\n\nConverted from Word document (${files[0].name}).`;
           }
-        );
+
+          pdfBlob = await convertTextOrWordToPdf(
+            content,
+            baseName,
+            (msg, pct) => {
+              setStatusMessage(msg);
+              setProcessProgress(pct);
+            }
+          );
+        }
 
         const chosenName = customFileName.trim()
           ? (customFileName.trim().toLowerCase().endsWith(".pdf")
@@ -784,13 +512,24 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
 
       // 6. PDF TO WORD (.DOCX) - 100% GENUINE OPENXML PKZIP
       else if (tool.id === "pdf-to-word") {
-        setStatusMessage("Compiling Microsoft Word (.docx) package with extracted content...");
-        setProcessProgress(50);
-        await new Promise((r) => setTimeout(r, 300));
+        setStatusMessage("Compiling Microsoft Word (.docx) package with extracted layout...");
+        setProcessProgress(40);
 
-        const textContent = extractedWordText || files[0].name;
+        const buffer = files[0].arrayBuffer || (await files[0].file.arrayBuffer());
+        let docModel = files[0].documentModel;
+        let textContent = extractedWordText;
 
-        const docxBlob = generateRealDocxBlob(baseName, textContent);
+        if (!docModel && buffer) {
+          const extracted = await extractRealPdfContent(buffer);
+          docModel = extracted.model;
+          if (!textContent) textContent = extracted.text;
+        }
+
+        if (!textContent) textContent = files[0].name;
+
+        const docxBlob = docModel
+          ? generateRealDocxBlob(baseName, docModel)
+          : generateRealDocxBlob(baseName, textContent);
 
         const txtBlob = new Blob([textContent], { type: "text/plain;charset=utf-8" });
         setAltTxtBlob(txtBlob);

@@ -224,8 +224,8 @@ export function QrCodeWorkspace({ tool }: QrCodeWorkspaceProps) {
   const [eyeOuterColor, setEyeOuterColor] = useState("#0d9488");
   const [eyeInnerColor, setEyeInnerColor] = useState("#0f172a");
 
-  // Logo / Image States
-  const [logoDataUri, setLogoDataUri] = useState<string | null>(svgToDataUri(PRESET_LOGOS[0].svg));
+  // Logo / Image States (defaults to null for clean, fast, 100% scannable QR codes)
+  const [logoDataUri, setLogoDataUri] = useState<string | null>(null);
   const [logoSizeRatio, setLogoSizeRatio] = useState(0.20);
   const [logoMargin, setLogoMargin] = useState(6);
   const [logoShape, setLogoShape] = useState<"circle" | "rounded" | "square" | "none">("rounded");
@@ -1253,12 +1253,13 @@ export function QrCodeWorkspace({ tool }: QrCodeWorkspaceProps) {
                         <button
                           key={preset.id}
                           type="button"
-                          onClick={() => setLogoDataUri(dataUri)}
+                          onClick={() => setLogoDataUri(isSelected ? null : dataUri)}
                           title={preset.name}
-                          className={`flex flex-col items-center gap-1 p-2 rounded-xl border transition-all ${isSelected
-                              ? "border-teal-500 bg-teal-500/10 shadow-sm"
+                          className={`flex flex-col items-center gap-1 p-2 rounded-xl border transition-all ${
+                            isSelected
+                              ? "border-teal-500 bg-teal-500/10 shadow-sm ring-1 ring-teal-500"
                               : "border-slate-200 dark:border-slate-700 hover:border-slate-300"
-                            }`}
+                          }`}
                         >
                           <div
                             className="w-7 h-7 rounded-lg overflow-hidden flex items-center justify-center"

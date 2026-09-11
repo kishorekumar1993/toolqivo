@@ -478,7 +478,7 @@ export async function protectPdfBuffer(
   }
 
   if (onProgress) onProgress("Password protection applied successfully!", 100);
-  return new Blob([modifiedPdf], { type: "application/pdf" });
+  return new Blob([modifiedPdf as BlobPart], { type: "application/pdf" });
 }
 
 // =========================================================

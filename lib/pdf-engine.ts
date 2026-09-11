@@ -16,5 +16,6 @@ export * from "./pdf/rotate";
 export * from "./pdf/images";
 export * from "./pdf/security";
 export * from "./pdf/typography";
+export * from "./pdf/text-extractor";
 export * from "./document/docx";
 export * from "./document/xlsx";

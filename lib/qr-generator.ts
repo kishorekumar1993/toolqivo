@@ -1153,8 +1153,9 @@ export function generateQrMatrix(text: string, ecLevel: QrEcLevel = "M"): QrMatr
     H: QRErrorCorrectionLevel.H,
   };
 
-  const model = new QRCodeModel(0, ecMap[ecLevel]);
-  model.addData(text || " ");
+  const model = new QRCodeModel(0, ecMap[ecLevel] ?? QRErrorCorrectionLevel.M);
+  const safeText = (text && text.trim().length > 0) ? text : "https://toolqivo.com";
+  model.addData(safeText);
   model.make();
 
   const size = model.getModuleCount();
@@ -1188,15 +1189,23 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 
   return new Promise((resolve, reject) => {
     const img = new Image();
+    const timeout = setTimeout(() => {
+      reject(new Error("Image load timed out"));
+    }, 2500);
+
     // Do NOT set crossOrigin on data: or blob: URIs as some browsers reject them
     if (!src.startsWith("data:") && !src.startsWith("blob:")) {
       img.crossOrigin = "anonymous";
     }
     img.onload = () => {
+      clearTimeout(timeout);
       imageCache.set(src, img);
       resolve(img);
     };
-    img.onerror = (e) => reject(e);
+    img.onerror = (e) => {
+      clearTimeout(timeout);
+      reject(e);
+    };
     img.src = src;
   });
 }
@@ -1430,6 +1439,7 @@ export async function renderQrToCanvas(
   }
 
   // Determine logo cutout box in module coordinates
+  const shouldCutoutLogo = Boolean(logoUrl && logoImg);
   const logoTotalPx = qrAreaSize * logoSizeRatio;
   const logoBoxModules = Math.ceil(logoTotalPx / cellSize);
   const centerModule = Math.floor(matrixSize / 2);
@@ -1452,8 +1462,8 @@ export async function renderQrToCanvas(
         continue;
       }
 
-      // Skip modules behind logo
-      if (logoUrl && r >= logoModMin && r <= logoModMax && c >= logoModMin && c <= logoModMax) {
+      // Skip modules behind logo only when logo is loaded
+      if (shouldCutoutLogo && r >= logoModMin && r <= logoModMax && c >= logoModMin && c <= logoModMax) {
         continue;
       }
 

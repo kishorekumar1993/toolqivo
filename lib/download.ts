@@ -170,7 +170,7 @@ export function downloadFile(
         blob = new Blob([data], { type: targetMime });
       }
     } else if (data instanceof Uint8Array) {
-      blob = new Blob([data], { type: targetMime });
+      blob = new Blob([data as BlobPart], { type: targetMime });
     } else if (data instanceof ArrayBuffer) {
       blob = new Blob([data], { type: targetMime });
     } else if (typeof data === "string") {

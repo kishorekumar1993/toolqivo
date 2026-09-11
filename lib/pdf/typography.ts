@@ -1,10 +1,12 @@
 /**
- * Toolqivo PDF Typography and Document Generation Engine
- * Handles Unicode transliteration, text-to-PDF, and spreadsheet-to-PDF formatting
+ * Toolqivo PDF Typography and Document Layout Engine
+ * Converts Document Models, Word DOCX structure, and rich tabular data into clean, multi-page PDFs
+ * 100% Client-Side with zero server upload.
  */
 
 import { getPdfLib } from "./loader";
 import { PdfEngineError } from "./errors";
+import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxBlock } from "../document/docx";
 
 /**
  * Transliterate and sanitize Unicode strings, emojis, and symbols into safe printable characters
@@ -77,347 +79,402 @@ export function safeDrawText(page: any, text: string, options: any): void {
 }
 
 /**
- * Convert plain text or extracted Word paragraphs into a clean, multi-page PDF document
+ * Parse a hex color string ("#0F172A" or "0F172A") into pdf-lib RGB color
+ */
+function parseHexColor(PDFLib: any, hex?: string, defaultColor = { r: 0.1, g: 0.15, b: 0.2 }) {
+  if (!hex) return PDFLib.rgb(defaultColor.r, defaultColor.g, defaultColor.b);
+  const clean = hex.replace("#", "").trim();
+  if (clean.length === 6) {
+    const r = parseInt(clean.substring(0, 2), 16) / 255;
+    const g = parseInt(clean.substring(2, 4), 16) / 255;
+    const b = parseInt(clean.substring(4, 6), 16) / 255;
+    return PDFLib.rgb(r, g, b);
+  }
+  return PDFLib.rgb(defaultColor.r, defaultColor.g, defaultColor.b);
+}
+
+/**
+ * Wrap text into lines based on available maxWidth
+ */
+function wrapWords(font: any, text: string, fontSize: number, maxWidth: number): string[] {
+  const lines: string[] = [];
+  const words = text.split(/\s+/);
+  let currentLine = "";
+
+  for (const word of words) {
+    if (!word) continue;
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    const width = safeMeasureText(font, testLine, fontSize);
+    if (width <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+  return lines.length > 0 ? lines : [text];
+}
+
+/**
+ * Render a high-fidelity DocumentModel into a multi-page PDF document
+ */
+export async function convertDocumentModelToPdf(
+  model: DocumentModel,
+  docTitle: string = "Document",
+  onProgress?: (msg: string, pct: number) => void
+): Promise<Blob> {
+  if (onProgress) onProgress("Initializing PDF layout engine...", 15);
+  const PDFLib = await getPdfLib();
+  if (!PDFLib) {
+    throw new PdfEngineError("PDF engine could not be loaded in browser.", "LOADER_ERROR");
+  }
+
+  if (onProgress) onProgress("Embedding typography and font glyphs...", 35);
+  const pdfDoc = await PDFLib.PDFDocument.create();
+
+  const regularFont = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
+  const boldFont = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBold);
+  const italicFont = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaOblique);
+  const boldItalicFont = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBoldOblique);
+
+  // Document default settings
+  const firstSection = model.sections[0] || {
+    pageSize: { width: 595.28, height: 841.89 },
+    margins: { top: 54, right: 54, bottom: 54, left: 54 },
+    blocks: [],
+  };
+
+  const pageWidth = firstSection.pageSize?.width || 595.28;
+  const pageHeight = firstSection.pageSize?.height || 841.89;
+  const marginTop = Math.max(36, firstSection.margins?.top || 54);
+  const marginRight = Math.max(36, firstSection.margins?.right || 54);
+  const marginBottom = Math.max(36, firstSection.margins?.bottom || 54);
+  const marginLeft = Math.max(36, firstSection.margins?.left || 54);
+  const contentWidth = pageWidth - marginLeft - marginRight;
+
+  const pages: any[] = [];
+  let currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
+  pages.push(currentPage);
+  let currentY = pageHeight - marginTop;
+
+  const checkPageBreak = (neededHeight: number) => {
+    if (currentY - neededHeight < marginBottom) {
+      currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
+      pages.push(currentPage);
+      currentY = pageHeight - marginTop;
+    }
+  };
+
+  if (onProgress) onProgress("Rendering document sections and typography...", 60);
+
+  // Document Title Header (if not empty and not matching first heading)
+  const safeDocTitle = sanitizeTextForPdf(docTitle);
+  if (safeDocTitle && safeDocTitle !== "Document") {
+    safeDrawText(currentPage, safeDocTitle, {
+      x: marginLeft,
+      y: currentY - 18,
+      size: 18,
+      font: boldFont,
+      color: PDFLib.rgb(0.06, 0.09, 0.16),
+    });
+    currentY -= 32;
+  }
+
+  // Iterate sections and blocks
+  for (const section of model.sections) {
+    for (const block of section.blocks) {
+      if (block.type === "paragraph") {
+        const para = block as DocxParagraphBlock;
+        const isHeading = para.isHeading;
+        const level = para.headingLevel || 1;
+        const isListItem = para.isListItem;
+
+        const fontSize = isHeading ? (level === 1 ? 16 : level === 2 ? 13 : 11.5) : 10;
+        const lineHeight = fontSize * 1.35;
+        const beforeSpace = para.spacingBefore || (isHeading ? 10 : 2);
+        const afterSpace = para.spacingAfter || (isHeading ? 6 : 4);
+
+        currentY -= beforeSpace;
+        checkPageBreak(lineHeight + afterSpace);
+
+        const indent = isListItem ? 16 : 0;
+        const maxTextWidth = contentWidth - indent;
+
+        // Draw bullet point icon if list item
+        if (isListItem) {
+          safeDrawText(currentPage, "*", {
+            x: marginLeft + 4,
+            y: currentY - fontSize,
+            size: fontSize,
+            font: boldFont,
+            color: PDFLib.rgb(0.05, 0.58, 0.53),
+          });
+        }
+
+        // Aggregate runs into formatted lines
+        for (const run of para.runs) {
+          const runText = sanitizeTextForPdf(run.text);
+          if (!runText) continue;
+
+          let runFont = regularFont;
+          if (run.bold && run.italic) runFont = boldItalicFont;
+          else if (run.bold || isHeading) runFont = boldFont;
+          else if (run.italic) runFont = italicFont;
+
+          const runFontSize = run.fontSize || fontSize;
+          const runColor = parseHexColor(PDFLib, run.color, isHeading ? { r: 0.06, g: 0.09, b: 0.16 } : { r: 0.12, g: 0.16, b: 0.23 });
+
+          const wrappedLines = wrapWords(runFont, runText, runFontSize, maxTextWidth);
+
+          for (const line of wrappedLines) {
+            checkPageBreak(lineHeight);
+            let drawX = marginLeft + indent;
+            if (para.alignment === "center") {
+              const textW = safeMeasureText(runFont, line, runFontSize);
+              drawX = marginLeft + (contentWidth - textW) / 2;
+            } else if (para.alignment === "right") {
+              const textW = safeMeasureText(runFont, line, runFontSize);
+              drawX = marginLeft + contentWidth - textW;
+            }
+
+            safeDrawText(currentPage, line, {
+              x: drawX,
+              y: currentY - runFontSize,
+              size: runFontSize,
+              font: runFont,
+              color: runColor,
+            });
+
+            currentY -= lineHeight;
+          }
+        }
+
+        currentY -= afterSpace;
+      } else if (block.type === "table") {
+        const tbl = block as DocxTableBlock;
+        if (tbl.rows.length === 0) continue;
+
+        currentY -= 8;
+        const numCols = Math.max(...tbl.rows.map((r) => r.cells.length));
+        if (numCols === 0) continue;
+
+        const colWidth = contentWidth / numCols;
+        const cellPadding = 5;
+
+        for (let rIdx = 0; rIdx < tbl.rows.length; rIdx++) {
+          const row = tbl.rows[rIdx];
+          const isHeader = row.isHeader || rIdx === 0;
+
+          // Compute row height based on cell text wraps
+          let maxCellLines = 1;
+          const cellLinesList: string[][] = [];
+
+          for (let cIdx = 0; cIdx < numCols; cIdx++) {
+            const cell = row.cells[cIdx];
+            const cellText = cell
+              ? cell.blocks
+                  .map((p) => p.runs.map((r) => r.text).join(""))
+                  .join(" ")
+              : "";
+            const safeCell = sanitizeTextForPdf(cellText);
+            const wrapped = wrapWords(isHeader ? boldFont : regularFont, safeCell, 9, colWidth - cellPadding * 2);
+            cellLinesList.push(wrapped);
+            if (wrapped.length > maxCellLines) maxCellLines = wrapped.length;
+          }
+
+          const rowHeight = maxCellLines * 12 + cellPadding * 2;
+          checkPageBreak(rowHeight);
+
+          // Draw row background
+          const rowBg = isHeader
+            ? PDFLib.rgb(0.94, 0.96, 0.98) // slate-100
+            : rIdx % 2 === 1
+            ? PDFLib.rgb(0.98, 0.99, 1.0)
+            : PDFLib.rgb(1, 1, 1);
+
+          currentPage.drawRectangle({
+            x: marginLeft,
+            y: currentY - rowHeight,
+            width: contentWidth,
+            height: rowHeight,
+            color: rowBg,
+            borderColor: PDFLib.rgb(0.85, 0.88, 0.92),
+            borderWidth: 0.5,
+          });
+
+          // Draw cell borders & text
+          for (let cIdx = 0; cIdx < numCols; cIdx++) {
+            const cellX = marginLeft + cIdx * colWidth;
+            const lines = cellLinesList[cIdx] || [];
+
+            for (let lIdx = 0; lIdx < lines.length; lIdx++) {
+              safeDrawText(currentPage, lines[lIdx], {
+                x: cellX + cellPadding,
+                y: currentY - cellPadding - 9 - lIdx * 12,
+                size: 9,
+                font: isHeader ? boldFont : regularFont,
+                color: isHeader ? PDFLib.rgb(0.06, 0.09, 0.16) : PDFLib.rgb(0.12, 0.16, 0.23),
+              });
+            }
+
+            // Cell vertical right border
+            if (cIdx < numCols - 1) {
+              currentPage.drawLine({
+                start: { x: cellX + colWidth, y: currentY },
+                end: { x: cellX + colWidth, y: currentY - rowHeight },
+                thickness: 0.5,
+                color: PDFLib.rgb(0.88, 0.91, 0.95),
+              });
+            }
+          }
+
+          currentY -= rowHeight;
+        }
+
+        currentY -= 10;
+      }
+    }
+  }
+
+  // Draw Page Numbers in Footer
+  if (onProgress) onProgress("Finalizing multi-page layout and numbering...", 90);
+  const totalPages = pages.length;
+  for (let i = 0; i < totalPages; i++) {
+    const p = pages[i];
+    const footerText = `Page ${i + 1} of ${totalPages}`;
+    const textW = safeMeasureText(regularFont, footerText, 8.5);
+    safeDrawText(p, footerText, {
+      x: (pageWidth - textW) / 2,
+      y: marginBottom / 2,
+      size: 8.5,
+      font: regularFont,
+      color: PDFLib.rgb(0.5, 0.55, 0.65),
+    });
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  if (onProgress) onProgress("Document conversion completed successfully!", 100);
+  return new Blob([pdfBytes], { type: "application/pdf" });
+}
+
+/**
+ * Convert plain text or markdown paragraphs into a structured PDF
  */
 export async function convertTextOrWordToPdf(
   textContent: string,
   title: string = "Document",
   onProgress?: (msg: string, pct: number) => void
 ): Promise<Blob> {
-  if (onProgress) onProgress("Initializing PDF typography engine...", 20);
-  const PDFLib = await getPdfLib();
-  if (!PDFLib) {
-    throw new PdfEngineError("PDF engine could not be loaded in browser.", "LOADER_ERROR");
-  }
+  const lines = textContent.split(/\r?\n/);
+  const blocks: DocxBlock[] = [];
 
-  if (onProgress) onProgress("Formatting document pages and typography...", 45);
-  const pdfDoc = await PDFLib.PDFDocument.create();
-  const helvetica = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
-  const helveticaBold = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBold);
+  let tableRowsAccumulator: string[][] = [];
 
-  const pageWidth = 595.28; // Standard A4 (pt)
-  const pageHeight = 841.89;
-  const margin = 50;
-  const contentWidth = pageWidth - margin * 2;
-
-  const fontSizeTitle = 18;
-  const fontSizeBody = 10.5;
-  const lineHeightTitle = 24;
-  const lineHeightBody = 15;
-  const paragraphSpacing = 8;
-
-  const safeTitle = sanitizeTextForPdf(title);
-  const safeContent = sanitizeTextForPdf(textContent);
-
-  const wrapText = (text: string, font: any, size: number, maxWidth: number): string[] => {
-    const lines: string[] = [];
-    const words = text.split(/\s+/);
-    let currentLine = "";
-
-    for (const word of words) {
-      const testLine = currentLine ? `${currentLine} ${word}` : word;
-      const width = safeMeasureText(font, testLine, size);
-      if (width <= maxWidth) {
-        currentLine = testLine;
-      } else {
-        if (currentLine) lines.push(currentLine);
-        currentLine = word;
-      }
+  const flushTable = () => {
+    if (tableRowsAccumulator.length > 0) {
+      blocks.push({
+        type: "table",
+        rows: tableRowsAccumulator.map((rowCells, rIdx) => ({
+          isHeader: rIdx === 0,
+          cells: rowCells.map((c) => ({
+            blocks: [
+              {
+                type: "paragraph",
+                runs: [{ text: c }],
+                spacingAfter: 0,
+              },
+            ],
+          })),
+        })),
+      });
+      tableRowsAccumulator = [];
     }
-    if (currentLine) lines.push(currentLine);
-    return lines;
   };
 
-  const rawParagraphs = safeContent.split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
-  const linesToRender: { text: string; isTitle?: boolean; isHeader?: boolean; spaceAfter?: number }[] = [];
-
-  // Title header
-  linesToRender.push({ text: safeTitle, isTitle: true, spaceAfter: 16 });
-
-  for (const para of rawParagraphs) {
-    const isHeading =
-      para.length < 60 &&
-      (para.startsWith("#") || para.toUpperCase() === para || para.endsWith(":"));
-    const cleanPara = para.replace(/^#+\s*/, "");
-
-    if (isHeading) {
-      linesToRender.push({ text: cleanPara, isHeader: true, spaceAfter: 6 });
-    } else {
-      const wrapped = wrapText(cleanPara, helvetica, fontSizeBody, contentWidth);
-      for (let i = 0; i < wrapped.length; i++) {
-        linesToRender.push({
-          text: wrapped[i],
-          spaceAfter: i === wrapped.length - 1 ? paragraphSpacing : 0,
-        });
-      }
-    }
-  }
-
-  // Draw lines across pages
-  let currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-  let y = pageHeight - margin - 20;
-
-  for (let idx = 0; idx < linesToRender.length; idx++) {
-    const line = linesToRender[idx];
-    const isTitle = line.isTitle;
-    const isHeader = line.isHeader;
-    const font = isTitle || isHeader ? helveticaBold : helvetica;
-    const size = isTitle ? fontSizeTitle : isHeader ? 12 : fontSizeBody;
-    const lHeight = isTitle ? lineHeightTitle : isHeader ? 18 : lineHeightBody;
-    const spaceAfter = line.spaceAfter || 0;
-
-    if (y - lHeight < margin + 30) {
-      currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-      y = pageHeight - margin;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      flushTable();
+      continue;
     }
 
-    const textColor = isTitle
-      ? PDFLib.rgb(0.06, 0.09, 0.16)
-      : isHeader
-      ? PDFLib.rgb(0.12, 0.16, 0.23)
-      : PDFLib.rgb(0.2, 0.25, 0.33);
+    if (line.includes(" | ") || (line.includes("\t") && line.split("\t").length > 1)) {
+      const cols = line.includes(" | ") ? line.split(" | ").map((c) => c.trim()) : line.split("\t").map((c) => c.trim());
+      tableRowsAccumulator.push(cols);
+      continue;
+    }
 
-    safeDrawText(currentPage, line.text, {
-      x: margin,
-      y: y - size,
-      size,
-      font,
-      color: textColor,
-    });
+    flushTable();
 
-    y -= lHeight + spaceAfter;
-  }
+    const isH1 = line.startsWith("# ");
+    const isH2 = line.startsWith("## ");
+    const isH3 = line.startsWith("### ") || (line.endsWith(":") && line.length < 50);
+    const isList = line.startsWith("* ") || line.startsWith("- ") || line.startsWith("• ");
 
-  // Add footer with page numbers and thin rule
-  const totalPages = pdfDoc.getPageCount();
-  const pages = pdfDoc.getPages();
-  for (let p = 0; p < totalPages; p++) {
-    const pObj = pages[p];
-    const footerText = `Page ${p + 1} of ${totalPages} - Converted with Toolqivo`;
-    const fWidth = safeMeasureText(helvetica, footerText, 8.5);
-    safeDrawText(pObj, footerText, {
-      x: (pageWidth - fWidth) / 2,
-      y: 28,
-      size: 8.5,
-      font: helvetica,
-      color: PDFLib.rgb(0.6, 0.65, 0.7),
-    });
+    const cleanText = line.replace(/^[#*•-]+\s*/, "");
 
-    pObj.drawLine({
-      start: { x: margin, y: 40 },
-      end: { x: pageWidth - margin, y: 40 },
-      thickness: 0.5,
-      color: PDFLib.rgb(0.9, 0.92, 0.95),
+    blocks.push({
+      type: "paragraph",
+      runs: [{ text: cleanText, bold: isH1 || isH2 || isH3 }],
+      isHeading: isH1 || isH2 || isH3,
+      headingLevel: isH1 ? 1 : isH2 ? 2 : isH3 ? 3 : undefined,
+      isListItem: isList,
+      spacingBefore: isH1 ? 12 : isH2 ? 8 : 2,
+      spacingAfter: isH1 ? 6 : isH2 ? 4 : 4,
     });
   }
 
-  if (onProgress) onProgress("Generating PDF document...", 90);
-  const pdfBytes = await pdfDoc.save();
-  return new Blob([pdfBytes], { type: "application/pdf" });
+  flushTable();
+
+  const model: DocumentModel = {
+    title,
+    sections: [
+      {
+        pageSize: { width: 595.28, height: 841.89 },
+        margins: { top: 54, right: 54, bottom: 54, left: 54 },
+        blocks,
+      },
+    ],
+  };
+
+  return convertDocumentModelToPdf(model, title, onProgress);
 }
 
 /**
- * Convert tabular grid data into a clean, grid-aligned, multi-page PDF document
+ * Convert tabular rows (from spreadsheet or CSV) to formatted PDF
  */
 export async function convertTableOrSpreadsheetToPdf(
-  tableData: string[][],
+  rows: string[][],
   title: string = "Spreadsheet",
   onProgress?: (msg: string, pct: number) => void
 ): Promise<Blob> {
-  if (onProgress) onProgress("Initializing PDF spreadsheet engine...", 20);
-  const PDFLib = await getPdfLib();
-  if (!PDFLib) {
-    throw new PdfEngineError("PDF engine could not be loaded in browser.", "LOADER_ERROR");
-  }
-
-  if (tableData.length === 0) {
-    tableData = [
-      ["Column 1", "Column 2", "Column 3"],
-      ["Sample Data 1", "Sample Data 2", "Sample Data 3"],
-    ];
-  }
-
-  // Normalize column count across all rows
-  const maxCols = Math.max(...tableData.map((r) => r.length), 1);
-  const normalizedRows = tableData.map((r) => {
-    const row = [...r];
-    while (row.length < maxCols) row.push("");
-    return row.map((cell) => sanitizeTextForPdf(cell));
-  });
-
-  // Automatically select landscape if > 4 columns for best readability
-  const isLandscape = maxCols > 4;
-  const pageWidth = isLandscape ? 841.89 : 595.28;
-  const pageHeight = isLandscape ? 595.28 : 841.89;
-  const margin = 40;
-  const tableWidth = pageWidth - margin * 2;
-
-  if (onProgress) onProgress("Calculating table layout and column widths...", 40);
-  const pdfDoc = await PDFLib.PDFDocument.create();
-  const helvetica = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
-  const helveticaBold = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBold);
-
-  // Calculate proportional column widths based on max content length
-  const colMaxChars = new Array(maxCols).fill(4);
-  normalizedRows.forEach((row) => {
-    row.forEach((cell, cIdx) => {
-      colMaxChars[cIdx] = Math.max(colMaxChars[cIdx], Math.min(cell.length, 30));
-    });
-  });
-  const totalChars = colMaxChars.reduce((sum, c) => sum + c, 0) || 1;
-  const colWidths = colMaxChars.map((c) => Math.max(50, (c / totalChars) * tableWidth));
-  const curSum = colWidths.reduce((a, b) => a + b, 0);
-  const scaleRatio = tableWidth / curSum;
-  for (let i = 0; i < colWidths.length; i++) {
-    colWidths[i] = colWidths[i] * scaleRatio;
-  }
-
-  const rowHeight = 22;
-  const headerHeight = 26;
-  const fontSize = 8.5;
-  const headerFontSize = 9.5;
-
-  const safeTitle = sanitizeTextForPdf(title);
-
-  let currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-  let y = pageHeight - margin;
-
-  // Title header
-  safeDrawText(currentPage, safeTitle, {
-    x: margin,
-    y: y - 16,
-    size: 16,
-    font: helveticaBold,
-    color: PDFLib.rgb(0.06, 0.09, 0.16),
-  });
-
-  safeDrawText(currentPage, `Exported with Toolqivo - ${normalizedRows.length} Rows, ${maxCols} Columns`, {
-    x: margin,
-    y: y - 32,
-    size: 9,
-    font: helvetica,
-    color: PDFLib.rgb(0.4, 0.45, 0.55),
-  });
-
-  y -= 52;
-
-  const drawHeaderRow = (page: any, atY: number) => {
-    page.drawRectangle({
-      x: margin,
-      y: atY - headerHeight,
-      width: tableWidth,
-      height: headerHeight,
-      color: PDFLib.rgb(0.92, 0.95, 0.98),
-      borderColor: PDFLib.rgb(0.8, 0.85, 0.92),
-      borderWidth: 1,
-    });
-
-    let cellX = margin;
-    for (let c = 0; c < maxCols; c++) {
-      const headerText = normalizedRows[0][c] || `Col ${c + 1}`;
-      const cellW = colWidths[c];
-
-      let display = headerText;
-      while (safeMeasureText(helveticaBold, display, headerFontSize) > cellW - 12 && display.length > 2) {
-        display = display.slice(0, -1);
-      }
-
-      safeDrawText(page, display, {
-        x: cellX + 6,
-        y: atY - headerHeight + 8,
-        size: headerFontSize,
-        font: helveticaBold,
-        color: PDFLib.rgb(0.12, 0.18, 0.3),
-      });
-
-      if (c < maxCols - 1) {
-        page.drawLine({
-          start: { x: cellX + cellW, y: atY },
-          end: { x: cellX + cellW, y: atY - headerHeight },
-          thickness: 0.75,
-          color: PDFLib.rgb(0.8, 0.85, 0.92),
-        });
-      }
-      cellX += cellW;
-    }
+  const model: DocumentModel = {
+    title,
+    sections: [
+      {
+        pageSize: { width: 841.89, height: 595.28 }, // Landscape A4 for wide tables
+        margins: { top: 40, right: 40, bottom: 40, left: 40 },
+        blocks: [
+          {
+            type: "table",
+            rows: rows.map((r, rIdx) => ({
+              isHeader: rIdx === 0,
+              cells: r.map((c) => ({
+                blocks: [
+                  {
+                    type: "paragraph",
+                    runs: [{ text: c }],
+                    spacingAfter: 0,
+                  },
+                ],
+              })),
+            })),
+          },
+        ],
+      },
+    ],
   };
 
-  drawHeaderRow(currentPage, y);
-  y -= headerHeight;
-
-  const dataRows = normalizedRows.length > 1 ? normalizedRows.slice(1) : normalizedRows;
-
-  for (let rIdx = 0; rIdx < dataRows.length; rIdx++) {
-    const row = dataRows[rIdx];
-
-    if (y - rowHeight < margin + 40) {
-      currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-      y = pageHeight - margin;
-      drawHeaderRow(currentPage, y);
-      y -= headerHeight;
-    }
-
-    const isEven = rIdx % 2 === 0;
-    const bgColor = isEven ? PDFLib.rgb(1, 1, 1) : PDFLib.rgb(0.97, 0.98, 0.99);
-
-    currentPage.drawRectangle({
-      x: margin,
-      y: y - rowHeight,
-      width: tableWidth,
-      height: rowHeight,
-      color: bgColor,
-      borderColor: PDFLib.rgb(0.88, 0.91, 0.95),
-      borderWidth: 0.75,
-    });
-
-    let cellX = margin;
-    for (let c = 0; c < maxCols; c++) {
-      const cellW = colWidths[c];
-      let cellText = row[c] || "";
-
-      while (safeMeasureText(helvetica, cellText, fontSize) > cellW - 12 && cellText.length > 2) {
-        cellText = cellText.slice(0, -1);
-      }
-
-      safeDrawText(currentPage, cellText, {
-        x: cellX + 6,
-        y: y - rowHeight + 7,
-        size: fontSize,
-        font: helvetica,
-        color: PDFLib.rgb(0.2, 0.25, 0.35),
-      });
-
-      if (c < maxCols - 1) {
-        currentPage.drawLine({
-          start: { x: cellX + cellW, y },
-          end: { x: cellX + cellW, y: y - rowHeight },
-          thickness: 0.5,
-          color: PDFLib.rgb(0.9, 0.92, 0.96),
-        });
-      }
-      cellX += cellW;
-    }
-
-    y -= rowHeight;
-  }
-
-  // Add footers across all pages
-  const totalPages = pdfDoc.getPageCount();
-  const pages = pdfDoc.getPages();
-  for (let p = 0; p < totalPages; p++) {
-    const pObj = pages[p];
-    const footerText = `Page ${p + 1} of ${totalPages} - Converted with Toolqivo Spreadsheet Engine`;
-    const fWidth = safeMeasureText(helvetica, footerText, 8.5);
-    safeDrawText(pObj, footerText, {
-      x: (pageWidth - fWidth) / 2,
-      y: 20,
-      size: 8.5,
-      font: helvetica,
-      color: PDFLib.rgb(0.6, 0.65, 0.7),
-    });
-  }
-
-  if (onProgress) onProgress("Finalizing PDF spreadsheet...", 95);
-  const pdfBytes = await pdfDoc.save();
-  return new Blob([pdfBytes], { type: "application/pdf" });
+  return convertDocumentModelToPdf(model, title, onProgress);
 }
