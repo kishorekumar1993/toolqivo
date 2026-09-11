@@ -528,8 +528,8 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
         if (!textContent) textContent = files[0].name;
 
         const docxBlob = docModel
-          ? generateRealDocxBlob(baseName, docModel)
-          : generateRealDocxBlob(baseName, textContent);
+          ? generateRealDocxBlob("Converted Document", docModel)
+          : generateRealDocxBlob("Converted Document", textContent);
 
         const txtBlob = new Blob([textContent], { type: "text/plain;charset=utf-8" });
         setAltTxtBlob(txtBlob);

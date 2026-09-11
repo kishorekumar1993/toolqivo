@@ -43,7 +43,7 @@ export interface DocxParagraphBlock {
 }
 
 export interface DocxTableCell {
-  blocks: DocxParagraphBlock[];
+  blocks: (DocxParagraphBlock | DocxImageBlock)[];
   width?: number; // in pt
   bgColor?: string; // hex e.g. "F1F5F9"
   colSpan?: number;
@@ -69,6 +69,15 @@ export interface DocxImageBlock {
   width: number; // in pt
   height: number; // in pt
   altText?: string;
+
+  // Original PDF position in points.
+  // PDF coordinates are converted to top-left coordinates.
+  x?: number;
+  y?: number;
+
+  // Keep image positioned instead of treating it as a normal
+  // flowing paragraph.
+  position?: "absolute" | "inline";
 }
 
 export type DocxBlock = DocxParagraphBlock | DocxTableBlock | DocxImageBlock;
@@ -798,13 +807,13 @@ function parseTableXml(
             colSpan = parseInt(spanMatch[1], 10);
           }
 
-          const cellBlocks: DocxParagraphBlock[] = [];
+          const cellBlocks: (DocxParagraphBlock | DocxImageBlock)[] = [];
           const cellPMatches = tcXml.match(/<w:p\b[\s\S]*?<\/w:p>/g);
           if (cellPMatches) {
             for (const cellP of cellPMatches) {
               const parsed = parseParagraphXml(cellP, relMap, mediaFiles);
               for (const b of parsed) {
-                if (b.type === "paragraph") cellBlocks.push(b);
+                if (b.type === "paragraph" || b.type === "image") cellBlocks.push(b as DocxParagraphBlock | DocxImageBlock);
               }
             }
           }
@@ -1271,55 +1280,96 @@ export function generateRealDocxBlob(
             `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${imgFileName}"/>`
           );
 
+          let ptWidth = img.width || 120;
+          let ptHeight = img.height || 120;
           const maxPtWidth = 460;
-          let ptWidth = img.width || 380;
-          let ptHeight = img.height || 260;
           if (ptWidth > maxPtWidth) {
             const scale = maxPtWidth / ptWidth;
             ptWidth = maxPtWidth;
-            ptHeight = ptHeight * scale;
+            ptHeight *= scale;
           }
 
           const emuWidth = Math.round(ptWidth * 12700);
           const emuHeight = Math.round(ptHeight * 12700);
-          const imgAlign = ptWidth < 220 ? "left" : "center";
 
-          bodyXmlParts.push(`<w:p>
-            <w:pPr><w:jc w:val="${imgAlign}"/><w:spacing w:before="80" w:after="80"/></w:pPr>
-            <w:r>
-              <w:drawing>
-                <wp:inline distT="0" distB="0" distL="0" distR="0">
-                  <wp:extent cx="${emuWidth}" cy="${emuHeight}"/>
-                  <wp:effectExtent l="0" t="0" r="0" b="0"/>
-                  <wp:docPr id="${imageCounter}" name="Picture ${imageCounter}" descr="${escapeXml(img.altText || 'Document Image')}"/>
-                  <wp:cNvGraphicFramePr>
-                    <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
-                  </wp:cNvGraphicFramePr>
-                  <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-                    <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
-                      <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
-                        <pic:nvPicPr>
-                          <pic:cNvPr id="${imageCounter}" name="Picture ${imageCounter}"/>
-                          <pic:cNvPicPr/>
-                        </pic:nvPicPr>
-                        <pic:blipFill>
-                          <a:blip r:embed="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
-                          <a:stretch><a:fillRect/></a:stretch>
-                        </pic:blipFill>
-                        <pic:spPr>
-                          <a:xfrm>
-                            <a:off x="0" y="0"/>
-                            <a:ext cx="${emuWidth}" cy="${emuHeight}"/>
-                          </a:xfrm>
-                          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-                        </pic:spPr>
-                      </pic:pic>
-                    </a:graphicData>
-                  </a:graphic>
-                </wp:inline>
-              </w:drawing>
-            </w:r>
-          </w:p>`);
+          const picXml = `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+            <pic:nvPicPr>
+              <pic:cNvPr id="${imageCounter}" name="Picture ${imageCounter}"/>
+              <pic:cNvPicPr/>
+            </pic:nvPicPr>
+            <pic:blipFill>
+              <a:blip r:embed="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
+              <a:stretch><a:fillRect/></a:stretch>
+            </pic:blipFill>
+            <pic:spPr>
+              <a:xfrm>
+                <a:off x="0" y="0"/>
+                <a:ext cx="${emuWidth}" cy="${emuHeight}"/>
+              </a:xfrm>
+              <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+            </pic:spPr>
+          </pic:pic>`;
+
+          /*
+           * Absolute positioned image — use wp:anchor
+           */
+          if (
+            img.position === "absolute" &&
+            img.x !== undefined &&
+            img.y !== undefined
+          ) {
+            const posX = Math.round(img.x * 12700);
+            const posY = Math.round(img.y * 12700);
+
+            bodyXmlParts.push(`<w:p>
+              <w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr>
+              <w:r>
+                <w:drawing>
+                  <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">
+                    <wp:simplePos x="0" y="0"/>
+                    <wp:positionH relativeFrom="page"><wp:posOffset>${posX}</wp:posOffset></wp:positionH>
+                    <wp:positionV relativeFrom="page"><wp:posOffset>${posY}</wp:posOffset></wp:positionV>
+                    <wp:extent cx="${emuWidth}" cy="${emuHeight}"/>
+                    <wp:effectExtent l="0" t="0" r="0" b="0"/>
+                    <wp:wrapNone/>
+                    <wp:docPr id="${imageCounter}" name="Picture ${imageCounter}" descr="${escapeXml(img.altText || 'Document Image')}"/>
+                    <wp:cNvGraphicFramePr>
+                      <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
+                    </wp:cNvGraphicFramePr>
+                    <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                      <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                        ${picXml}
+                      </a:graphicData>
+                    </a:graphic>
+                  </wp:anchor>
+                </w:drawing>
+              </w:r>
+            </w:p>`);
+          } else {
+            /*
+             * Normal inline image — use wp:inline
+             */
+            bodyXmlParts.push(`<w:p>
+              <w:pPr><w:jc w:val="center"/><w:spacing w:before="80" w:after="80"/></w:pPr>
+              <w:r>
+                <w:drawing>
+                  <wp:inline distT="0" distB="0" distL="0" distR="0">
+                    <wp:extent cx="${emuWidth}" cy="${emuHeight}"/>
+                    <wp:effectExtent l="0" t="0" r="0" b="0"/>
+                    <wp:docPr id="${imageCounter}" name="Picture ${imageCounter}" descr="${escapeXml(img.altText || 'Document Image')}"/>
+                    <wp:cNvGraphicFramePr>
+                      <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
+                    </wp:cNvGraphicFramePr>
+                    <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                      <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                        ${picXml}
+                      </a:graphicData>
+                    </a:graphic>
+                  </wp:inline>
+                </w:drawing>
+              </w:r>
+            </w:p>`);
+          }
         }
       }
     }

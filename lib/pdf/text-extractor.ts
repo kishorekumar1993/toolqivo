@@ -516,117 +516,245 @@ async function extractImagesFromPdfJsPage(
 
   try {
     const opList = await page.getOperatorList();
-    if (!opList || !opList.fnArray) return results;
+
+    if (!opList?.fnArray || !opList?.argsArray) {
+      return results;
+    }
 
     const fnArray = opList.fnArray;
     const argsArray = opList.argsArray;
+
+    // PDF transformation matrix:
+    // [a, b, c, d, e, f]
     let currentTransform = [1, 0, 0, 1, 0, 0];
+
     const transformStack: number[][] = [];
+
+    const multiplyMatrices = (
+      m1: number[],
+      m2: number[]
+    ): number[] => {
+      const [a1, b1, c1, d1, e1, f1] = m1;
+      const [a2, b2, c2, d2, e2, f2] = m2;
+
+      return [
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+      ];
+    };
+
+    /*
+     * PDF.js OPS constants can vary slightly between versions.
+     * These are the image painting operations normally used by PDF.js.
+     */
+    const IMAGE_OPS = new Set([
+      82, // paintInlineImageXObject
+      83, // paintImageMaskXObject
+      85, // paintImageXObject
+      86, // paintSolidColorImageMask
+    ]);
 
     for (let i = 0; i < fnArray.length; i++) {
       const fn = fnArray[i];
       const args = argsArray[i];
 
+      // save
       if (fn === 11) {
-        // OPS.save
         transformStack.push([...currentTransform]);
-      } else if (fn === 12) {
-        // OPS.restore
+        continue;
+      }
+
+      // restore
+      if (fn === 12) {
         if (transformStack.length > 0) {
           currentTransform = transformStack.pop()!;
         }
-      } else if (fn === 13 && args && args.length >= 6) {
-        // OPS.transform
-        currentTransform = args;
-      } else if (fn === 85 || fn === 86 || fn === 82 || fn === 83) {
-        // paintImageXObject, paintInlineImageXObject, paintImageMaskXObject
-        const imgObjName = args && args[0] ? args[0] : null;
-        if (imgObjName && page.objs) {
+        continue;
+      }
+
+      // transform
+      if (fn === 13 && args?.length >= 6) {
+        currentTransform = multiplyMatrices(
+          currentTransform,
+          args
+        );
+        continue;
+      }
+
+      if (!IMAGE_OPS.has(fn)) {
+        continue;
+      }
+
+      const imgObjName =
+        args && args.length > 0 ? args[0] : null;
+
+      if (!imgObjName || !page.objs) {
+        continue;
+      }
+
+      try {
+        /*
+         * IMPORTANT:
+         * Do not use a 300ms timeout here.
+         * Large PDFs and browser scheduling can easily take longer.
+         */
+        const imgData = await new Promise<any>((resolve) => {
+          let resolved = false;
+
+          const done = (obj: any) => {
+            if (resolved) return;
+            resolved = true;
+            resolve(obj);
+          };
+
           try {
-            const imgData = await new Promise<any>((resolve) => {
-              try {
-                page.objs.get(imgObjName, (obj: any) => resolve(obj));
-                setTimeout(() => resolve(null), 300);
-              } catch {
-                resolve(null);
-              }
-            });
-
-            if (
-              imgData &&
-              imgData.width >= 16 &&
-              imgData.height >= 16 &&
-              imgData.data &&
-              typeof document !== "undefined"
-            ) {
-              const canvas = document.createElement("canvas");
-              canvas.width = imgData.width;
-              canvas.height = imgData.height;
-              const ctx = canvas.getContext("2d");
-              if (ctx) {
-                const rawBuf = imgData.data;
-                const totalPixels = imgData.width * imgData.height;
-                let imgDataObj: ImageData | null = null;
-
-                if (rawBuf.length === totalPixels * 4) {
-                  imgDataObj = new ImageData(new Uint8ClampedArray(rawBuf), imgData.width, imgData.height);
-                } else if (rawBuf.length === totalPixels * 3) {
-                  const rgba = new Uint8ClampedArray(totalPixels * 4);
-                  for (let p = 0, q = 0; p < rawBuf.length; p += 3, q += 4) {
-                    rgba[q] = rawBuf[p];
-                    rgba[q + 1] = rawBuf[p + 1];
-                    rgba[q + 2] = rawBuf[p + 2];
-                    rgba[q + 3] = 255;
-                  }
-                  imgDataObj = new ImageData(rgba, imgData.width, imgData.height);
-                } else if (rawBuf.length === totalPixels) {
-                  const rgba = new Uint8ClampedArray(totalPixels * 4);
-                  for (let p = 0, q = 0; p < rawBuf.length; p++, q += 4) {
-                    const v = rawBuf[p];
-                    rgba[q] = v;
-                    rgba[q + 1] = v;
-                    rgba[q + 2] = v;
-                    rgba[q + 3] = 255;
-                  }
-                  imgDataObj = new ImageData(rgba, imgData.width, imgData.height);
-                }
-
-                if (imgDataObj) {
-                  ctx.putImageData(imgDataObj, 0, 0);
-                  const dataUrl = canvas.toDataURL("image/png");
-                  const base64 = dataUrl.split(",")[1];
-                  const binStr = atob(base64);
-                  const pngBytes = new Uint8Array(binStr.length);
-                  for (let b = 0; b < binStr.length; b++) pngBytes[b] = binStr.charCodeAt(b);
-
-                  const ptX = currentTransform[4] || 54;
-                  const ptY = (viewport.height || 841.89) - (currentTransform[5] || 750);
-                  const ptW = Math.round(Math.abs(currentTransform[0])) || Math.min(imgData.width, 180);
-                  const ptH = Math.round(Math.abs(currentTransform[3])) || Math.min(imgData.height, 180);
-
-                  results.push({
-                    image: {
-                      type: "image",
-                      data: pngBytes,
-                      mimeType: "image/png",
-                      width: ptW > 0 ? ptW : 120,
-                      height: ptH > 0 ? ptH : 120,
-                      altText: "Extracted Photo / Logo",
-                    },
-                    x: ptX,
-                    y: ptY,
-                  });
-                }
-              }
-            }
-          } catch (objErr) {
-            console.warn("Error resolving PDF.js image object:", objErr);
+            page.objs.get(imgObjName, done);
+          } catch {
+            resolve(null);
           }
+        });
+
+        if (
+          !imgData ||
+          !imgData.width ||
+          !imgData.height ||
+          !imgData.data ||
+          typeof document === "undefined"
+        ) {
+          continue;
         }
+
+        const width = imgData.width;
+        const height = imgData.height;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+
+        if (!ctx) {
+          continue;
+        }
+
+        const rawBuf = imgData.data;
+        const totalPixels = width * height;
+
+        let outputImageData: ImageData | null = null;
+
+        // RGBA
+        if (rawBuf.length === totalPixels * 4) {
+          outputImageData = new ImageData(
+            new Uint8ClampedArray(rawBuf),
+            width,
+            height
+          );
+        }
+        // RGB
+        else if (rawBuf.length === totalPixels * 3) {
+          const rgba = new Uint8ClampedArray(totalPixels * 4);
+          for (let p = 0, q = 0; p < rawBuf.length; p += 3, q += 4) {
+            rgba[q] = rawBuf[p];
+            rgba[q + 1] = rawBuf[p + 1];
+            rgba[q + 2] = rawBuf[p + 2];
+            rgba[q + 3] = 255;
+          }
+          outputImageData = new ImageData(rgba, width, height);
+        }
+        // Grayscale
+        else if (rawBuf.length === totalPixels) {
+          const rgba = new Uint8ClampedArray(totalPixels * 4);
+          for (let p = 0, q = 0; p < rawBuf.length; p++, q += 4) {
+            const value = rawBuf[p];
+            rgba[q] = value;
+            rgba[q + 1] = value;
+            rgba[q + 2] = value;
+            rgba[q + 3] = 255;
+          }
+          outputImageData = new ImageData(rgba, width, height);
+        }
+
+        if (!outputImageData) {
+          continue;
+        }
+
+        ctx.putImageData(outputImageData, 0, 0);
+
+        const dataUrl = canvas.toDataURL("image/png");
+        const base64 = dataUrl.split(",")[1];
+
+        if (!base64) {
+          continue;
+        }
+
+        const binary = atob(base64);
+        const pngBytes = new Uint8Array(binary.length);
+        for (let b = 0; b < binary.length; b++) {
+          pngBytes[b] = binary.charCodeAt(b);
+        }
+
+        /*
+         * Image transformation.
+         * The transform describes where the image is placed on the PDF page.
+         */
+        const a = currentTransform[0] || 1;
+        const d = currentTransform[3] || 1;
+        const e = currentTransform[4] || 0;
+        const f = currentTransform[5] || 0;
+
+        /*
+         * Actual displayed size.
+         * For most normal PDF images:
+         * |a| = displayed width, |d| = displayed height
+         */
+        let ptWidth = Math.abs(a);
+        let ptHeight = Math.abs(d);
+
+        if (!Number.isFinite(ptWidth) || ptWidth < 1) {
+          ptWidth = Math.min(width, 180);
+        }
+        if (!Number.isFinite(ptHeight) || ptHeight < 1) {
+          ptHeight = Math.min(height, 180);
+        }
+
+        /*
+         * PDF origin is bottom-left. Our document layout uses top-left.
+         */
+        let ptX = e;
+        let ptY = viewport.height - f - ptHeight;
+
+        if (!Number.isFinite(ptX)) ptX = 54;
+        if (!Number.isFinite(ptY)) ptY = 54;
+
+        /* Keep reasonable dimensions. */
+        ptWidth = Math.max(1, Math.min(ptWidth, viewport.width));
+        ptHeight = Math.max(1, Math.min(ptHeight, viewport.height));
+
+        results.push({
+          x: ptX,
+          y: ptY,
+          image: {
+            type: "image",
+            data: pngBytes,
+            mimeType: "image/png",
+            width: ptWidth,
+            height: ptHeight,
+            x: ptX,
+            y: ptY,
+            position: "absolute",
+            altText: "Extracted Photo / Logo",
+          },
+        });
+      } catch (imageError) {
+        console.warn("PDF image extraction warning:", imageError);
       }
     }
-  } catch (err) {
-    console.warn("extractImagesFromPdfJsPage warning:", err);
+  } catch (error) {
+    console.warn("extractImagesFromPdfJsPage warning:", error);
   }
 
   return results;
@@ -665,27 +793,31 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
         let finalPageBlocks: DocxBlock[] = [];
 
         if (pageImgResults.length > 0) {
-          pageImgResults.sort((a, b) => a.y - b.y);
-          // Images located in header / top region (y < 250 or at beginning)
-          const headerImgs = pageImgResults.filter((r) => r.y < 250);
-          const bodyImgs = pageImgResults.filter((r) => r.y >= 250);
-
-          if (headerImgs.length > 0) {
-            finalPageBlocks.push(...headerImgs.map((r) => r.image));
-          }
+          /*
+           * Preserve the original reading order:
+           * 1. Text blocks come first
+           * 2. Images are retained separately with their original absolute coordinates
+           * Do NOT put header images before the text.
+           */
           finalPageBlocks.push(...pageBlocks);
-          if (bodyImgs.length > 0) {
-            finalPageBlocks.push(...bodyImgs.map((r) => r.image));
+
+          for (const result of pageImgResults) {
+            result.image.x = result.x;
+            result.image.y = result.y;
+            result.image.position = "absolute";
+
+            finalPageBlocks.push(result.image);
           }
         } else {
+          finalPageBlocks = [...pageBlocks];
+
           // Fallback to byte stream scanned images
           const pageImgsFallback = extractedImages.slice(imgOffset, imgOffset + imagesPerPage);
           imgOffset += imagesPerPage;
 
-          if (pageImgsFallback.length > 0) {
-            finalPageBlocks = p === 1 ? [...pageImgsFallback, ...pageBlocks] : [...pageBlocks, ...pageImgsFallback];
-          } else {
-            finalPageBlocks = pageBlocks;
+          for (const img of pageImgsFallback) {
+            img.position = "inline";
+            finalPageBlocks.push(img);
           }
         }
 

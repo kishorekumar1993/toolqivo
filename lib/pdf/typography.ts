@@ -331,6 +331,151 @@ async function safelyEmbedImageInPdf(pdfDoc: any, imgBytes: Uint8Array, mimeType
 }
 
 /**
+ * Recursively find all image blocks inside a block array (including nested table cells)
+ */
+function findImagesInBlocks(blocks: any[]): DocxImageBlock[] {
+  const images: DocxImageBlock[] = [];
+  for (const block of blocks || []) {
+    if (block.type === "image") {
+      images.push(block as DocxImageBlock);
+    }
+    if (block.type === "table") {
+      for (const row of block.rows || []) {
+        for (const cell of row.cells || []) {
+          images.push(...findImagesInBlocks(cell.blocks || []));
+        }
+      }
+    }
+  }
+  return images;
+}
+
+/**
+ * Render a CV-style header table with profile photo on left and text on right.
+ * Returns the new currentY after rendering.
+ */
+async function renderHeaderTable(
+  tbl: DocxTableBlock,
+  pdfDoc: any,
+  currentPage: any,
+  fonts: { regular: any; bold: any; italic: any; boldItalic: any },
+  PDFLib: any,
+  marginLeft: number,
+  currentY: number,
+  contentWidth: number
+): Promise<number> {
+  if (!tbl.rows?.length) return currentY;
+
+  const firstRow = tbl.rows[0];
+  if (!firstRow.cells?.length) return currentY;
+
+  const allImages = findImagesInBlocks(
+    firstRow.cells.flatMap((cell: any) => cell.blocks || [])
+  );
+
+  if (allImages.length === 0) return currentY;
+
+  /*
+   * This is the resume header:
+   * ┌──────────┬─────────────────────────────┐
+   * │   PHOTO  │ Name                        │
+   * │          │ Designation                 │
+   * │          │ Contact                     │
+   * └──────────┴─────────────────────────────┘
+   */
+
+  const image = allImages[0];
+  let imageWidth = image.width || 75;
+  let imageHeight = image.height || 100;
+  const maxImageWidth = 85;
+  const maxImageHeight = 85;
+  const scale = Math.min(maxImageWidth / imageWidth, maxImageHeight / imageHeight, 1);
+  imageWidth *= scale;
+  imageHeight *= scale;
+
+  const headerHeight = Math.max(90, imageHeight + 20);
+
+  // Header background
+  currentPage.drawRectangle({
+    x: marginLeft,
+    y: currentY - headerHeight,
+    width: contentWidth,
+    height: headerHeight,
+    color: PDFLib.rgb(0.94, 0.96, 0.98),
+  });
+
+  // Draw profile image
+  try {
+    const embeddedImage = await safelyEmbedImageInPdf(pdfDoc, image.data, image.mimeType);
+    const imageX = marginLeft + 12;
+    const imageY = currentY - 10 - imageHeight;
+    currentPage.drawImage(embeddedImage, {
+      x: imageX,
+      y: imageY,
+      width: imageWidth,
+      height: imageHeight,
+    });
+  } catch (e) {
+    console.warn("Header profile image render failed:", e);
+  }
+
+  // Text starts after the photo
+  const textX = marginLeft + 120;
+  let textY = currentY - 22;
+
+  // Extract text from all header cells
+  const headerText: string[] = [];
+  for (const cell of firstRow.cells) {
+    for (const block of cell.blocks || []) {
+      if (block.type !== "paragraph") continue;
+      const text = ((block as DocxParagraphBlock).runs || [])
+        .map((r: any) => r.text || "")
+        .join("")
+        .trim();
+      if (text) headerText.push(text);
+    }
+  }
+
+  // Name
+  if (headerText[0]) {
+    safeDrawText(currentPage, sanitizeTextForPdf(headerText[0]), {
+      x: textX,
+      y: textY,
+      size: 18,
+      font: fonts.bold,
+      color: PDFLib.rgb(0.05, 0.25, 0.40),
+    });
+    textY -= 22;
+  }
+
+  // Designation
+  if (headerText[1]) {
+    safeDrawText(currentPage, sanitizeTextForPdf(headerText[1]), {
+      x: textX,
+      y: textY,
+      size: 11,
+      font: fonts.bold,
+      color: PDFLib.rgb(0.10, 0.45, 0.70),
+    });
+    textY -= 16;
+  }
+
+  // Remaining contact information
+  for (let i = 2; i < headerText.length; i++) {
+    safeDrawText(currentPage, sanitizeTextForPdf(headerText[i]), {
+      x: textX,
+      y: textY,
+      size: 8.5,
+      font: fonts.regular,
+      color: PDFLib.rgb(0.12, 0.16, 0.23),
+    });
+    textY -= 13;
+  }
+
+  return currentY - headerHeight - 14;
+}
+
+/**
  * Render a high-fidelity DocumentModel into a multi-page PDF document
  */
 export async function convertDocumentModelToPdf(
@@ -437,7 +582,36 @@ export async function convertDocumentModelToPdf(
         const rightIndent = para.rightIndent || 0;
         const firstLineIndent = para.firstLineIndent || 0;
         const hangingIndent = para.hangingIndent || 0;
-        const maxTextWidth = Math.max(60, currentContentWidth - baseLeftIndent - rightIndent);
+
+        /*
+         * Reserve left column for header photo.
+         * Typical CV profile photo: x ≈ 20-80, width ≈ 90-130
+         * Text starts after the photo.
+         */
+        let effectiveBaseLeftIndent = baseLeftIndent;
+
+        const hasLeftHeaderImage = section.blocks.some(
+          (b) =>
+            b.type === "image" &&
+            (b as DocxImageBlock).position === "absolute" &&
+            ((b as DocxImageBlock).x ?? 999) < currentMarginLeft + 120 &&
+            ((b as DocxImageBlock).y ?? 999) < 180
+        );
+
+        if (
+          hasLeftHeaderImage &&
+          currentY > currentSecPageHeight - currentMarginTop - 180
+        ) {
+          effectiveBaseLeftIndent = Math.max(
+            effectiveBaseLeftIndent,
+            125
+          );
+        }
+
+        const maxTextWidth = Math.max(
+          60,
+          currentContentWidth - effectiveBaseLeftIndent - rightIndent
+        );
 
         // Draw bullet point marker if list item
         if (isListItem) {
@@ -531,7 +705,7 @@ export async function convertDocumentModelToPdf(
 
           const lineIndentOffset = isFirstLine ? firstLineIndent : hangingIndent;
           const lineAvailableW = Math.max(50, maxTextWidth - lineIndentOffset);
-          const startBaseX = currentMarginLeft + baseLeftIndent + lineIndentOffset;
+          const startBaseX = currentMarginLeft + effectiveBaseLeftIndent + lineIndentOffset;
 
           let startX = startBaseX;
           let spaceExtra = 0;
@@ -613,6 +787,30 @@ export async function convertDocumentModelToPdf(
       } else if (block.type === "table") {
         const tbl = block as DocxTableBlock;
         if (tbl.rows.length === 0) continue;
+
+        // Detect header table with embedded image (CV profile photo)
+        const tableImages = findImagesInBlocks(
+          tbl.rows?.[0]?.cells?.flatMap((cell: any) => cell.blocks || []) || []
+        );
+
+        if (tableImages.length > 0 && tableImages[0]?.data) {
+          currentY = await renderHeaderTable(
+            tbl,
+            pdfDoc,
+            currentPage,
+            {
+              regular: fontSet.sans.regular,
+              bold: fontSet.sans.bold,
+              italic: fontSet.sans.italic,
+              boldItalic: fontSet.sans.boldItalic,
+            },
+            PDFLib,
+            currentMarginLeft,
+            currentY,
+            currentContentWidth
+          );
+          continue;
+        }
 
         currentY -= 6;
         const totalCols = Math.max(...tbl.rows.map((r) => r.cells.reduce((acc, c) => acc + (c.colSpan || 1), 0)));
@@ -738,10 +936,52 @@ export async function convertDocumentModelToPdf(
       } else if (block.type === "image") {
         try {
           const imgBlock = block as DocxImageBlock;
-          const embeddedImg = await safelyEmbedImageInPdf(pdfDoc, imgBlock.data, imgBlock.mimeType);
 
-          let imgW = imgBlock.width || 380;
-          let imgH = imgBlock.height || 240;
+          const embeddedImg = await safelyEmbedImageInPdf(
+            pdfDoc,
+            imgBlock.data,
+            imgBlock.mimeType
+          );
+
+          let imgW = imgBlock.width || 120;
+          let imgH = imgBlock.height || 120;
+
+          /*
+           * ABSOLUTE POSITIONED IMAGE
+           * Used for photos/logos extracted from PDF.
+           */
+          if (
+            imgBlock.position === "absolute" &&
+            imgBlock.x !== undefined &&
+            imgBlock.y !== undefined
+          ) {
+            /* Keep the image inside the page. */
+            imgW = Math.min(imgW, currentSecPageWidth - imgBlock.x - 10);
+            imgH = Math.min(imgH, currentSecPageHeight - imgBlock.y - 10);
+            imgW = Math.max(1, imgW);
+            imgH = Math.max(1, imgH);
+
+            /* Convert top-left Y into pdf-lib bottom-left Y. */
+            const drawX = imgBlock.x;
+            const drawY = currentSecPageHeight - imgBlock.y - imgH;
+
+            currentPage.drawImage(embeddedImg, {
+              x: drawX,
+              y: drawY,
+              width: imgW,
+              height: imgH,
+            });
+
+            /*
+             * IMPORTANT: Do not change currentY.
+             * Absolute images do not participate in normal document flow.
+             */
+            continue;
+          }
+
+          /*
+           * NORMAL INLINE IMAGE
+           */
           if (imgW > currentContentWidth) {
             const scale = currentContentWidth / imgW;
             imgW = currentContentWidth;
@@ -749,7 +989,8 @@ export async function convertDocumentModelToPdf(
           }
 
           checkPageBreak(imgH + 20);
-          const drawX = imgW < 220 ? currentMarginLeft : currentMarginLeft + (currentContentWidth - imgW) / 2;
+
+          const drawX = currentMarginLeft + (currentContentWidth - imgW) / 2;
 
           currentPage.drawImage(embeddedImg, {
             x: drawX,
