@@ -8,7 +8,7 @@
  */
 
 import { getPdfJs } from "./loader";
-import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxImageBlock, DocxBlock, DocxSection } from "../document/docx";
+import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxImageBlock, DocxBlock, DocxSection, DocxTextRun } from "../document/docx";
 
 export interface PdfTextItem {
   str: string;
