@@ -1,7 +1,7 @@
 /**
  * Toolqivo Advanced DOCX Document Model, Extraction & Generation Engine
  * Fully parses Microsoft Word (.docx) OpenXML PKZIP structure into a rich Document Model
- * (Sections, Paragraphs, TextRuns, Tables, Styles, Margins, Dimensions)
+ * (Sections, Paragraphs, TextRuns, Tables, Images, DrawingML, Styles, Margins, Dimensions)
  * and generates clean, valid Microsoft Word OpenXML packages.
  * 100% Client-Side with zero server upload.
  */
@@ -17,7 +17,11 @@ export interface DocxTextRun {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+  strike?: boolean;
+  superscript?: boolean;
+  subscript?: boolean;
   color?: string; // hex e.g. "0F172A" or "#0F172A"
+  highlight?: string; // hex or color name e.g. "FFFF00" or "yellow"
 }
 
 export interface DocxParagraphBlock {
@@ -30,7 +34,12 @@ export interface DocxParagraphBlock {
   bulletChar?: string;
   spacingBefore?: number; // in pt
   spacingAfter?: number; // in pt
-  lineSpacing?: number;
+  lineSpacing?: number; // in pt
+  leftIndent?: number; // in pt
+  rightIndent?: number; // in pt
+  firstLineIndent?: number; // in pt
+  hangingIndent?: number; // in pt
+  pageBreakBefore?: boolean;
 }
 
 export interface DocxTableCell {
@@ -49,20 +58,57 @@ export interface DocxTableRow {
 export interface DocxTableBlock {
   type: "table";
   rows: DocxTableRow[];
+  colWidths?: number[]; // in pt
   hasHeader?: boolean;
 }
 
-export type DocxBlock = DocxParagraphBlock | DocxTableBlock;
+export interface DocxImageBlock {
+  type: "image";
+  data: Uint8Array; // Raw PNG or JPEG binary bytes
+  mimeType: "image/png" | "image/jpeg";
+  width: number; // in pt
+  height: number; // in pt
+  altText?: string;
+}
+
+export type DocxBlock = DocxParagraphBlock | DocxTableBlock | DocxImageBlock;
 
 export interface DocxSection {
   pageSize: { width: number; height: number }; // in pt (e.g. 595.28 x 841.89 for A4)
   margins: { top: number; right: number; bottom: number; left: number }; // in pt
+  orientation?: "portrait" | "landscape";
   blocks: DocxBlock[];
 }
 
 export interface DocumentModel {
   sections: DocxSection[];
   title?: string;
+}
+
+// ==========================================
+// XML Entity & Escape Utilities
+// ==========================================
+
+export function decodeXmlEntities(str: string): string {
+  if (!str) return "";
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+export function escapeXml(str: string): string {
+  if (!str) return "";
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 // ==========================================
@@ -95,44 +141,42 @@ export function buildZip(entries: ZipEntry[]): Uint8Array {
     const crc = computeCrc32(entry.data);
     const size = entry.data.length;
 
-    // Local file header (30 + nameLen bytes) + uncompressed data
     const lh = new Uint8Array(30 + nameBytes.length + size);
     const lView = new DataView(lh.buffer);
-    lView.setUint32(0, 0x04034b50, true); // Local file header signature
-    lView.setUint16(4, 20, true); // Version needed to extract (2.0)
-    lView.setUint16(6, 0, true); // General purpose bit flag
-    lView.setUint16(8, 0, true); // Compression method (0 = store)
-    lView.setUint16(10, 0, true); // Last mod file time
-    lView.setUint16(12, 0, true); // Last mod file date
-    lView.setUint32(14, crc, true); // CRC-32
-    lView.setUint32(18, size, true); // Compressed size
-    lView.setUint32(22, size, true); // Uncompressed size
-    lView.setUint16(26, nameBytes.length, true); // File name length
-    lView.setUint16(28, 0, true); // Extra field length
+    lView.setUint32(0, 0x04034b50, true);
+    lView.setUint16(4, 20, true);
+    lView.setUint16(6, 0, true);
+    lView.setUint16(8, 0, true);
+    lView.setUint16(10, 0, true);
+    lView.setUint16(12, 0, true);
+    lView.setUint32(14, crc, true);
+    lView.setUint32(18, size, true);
+    lView.setUint32(22, size, true);
+    lView.setUint16(26, nameBytes.length, true);
+    lView.setUint16(28, 0, true);
     lh.set(nameBytes, 30);
     lh.set(entry.data, 30 + nameBytes.length);
     localHeaders.push(lh);
 
-    // Central directory header (46 + nameLen bytes)
     const ch = new Uint8Array(46 + nameBytes.length);
     const cView = new DataView(ch.buffer);
-    cView.setUint32(0, 0x02014b50, true); // Central file header signature
-    cView.setUint16(4, 20, true); // Version made by
-    cView.setUint16(6, 20, true); // Version needed to extract
-    cView.setUint16(8, 0, true); // General purpose bit flag
-    cView.setUint16(10, 0, true); // Compression method (0 = store)
-    cView.setUint16(12, 0, true); // Last mod file time
-    cView.setUint16(14, 0, true); // Last mod file date
-    cView.setUint32(16, crc, true); // CRC-32
-    cView.setUint32(20, size, true); // Compressed size
-    cView.setUint32(24, size, true); // Uncompressed size
-    cView.setUint16(28, nameBytes.length, true); // File name length
-    cView.setUint16(30, 0, true); // Extra field length
-    cView.setUint16(32, 0, true); // File comment length
-    cView.setUint16(34, 0, true); // Disk number start
-    cView.setUint16(36, 0, true); // Internal file attributes
-    cView.setUint32(38, 0, true); // External file attributes
-    cView.setUint32(42, offset, true); // Relative offset of local header
+    cView.setUint32(0, 0x02014b50, true);
+    cView.setUint16(4, 20, true);
+    cView.setUint16(6, 20, true);
+    cView.setUint16(8, 0, true);
+    cView.setUint16(10, 0, true);
+    cView.setUint16(12, 0, true);
+    cView.setUint16(14, 0, true);
+    cView.setUint32(16, crc, true);
+    cView.setUint32(20, size, true);
+    cView.setUint32(24, size, true);
+    cView.setUint16(28, nameBytes.length, true);
+    cView.setUint16(30, 0, true);
+    cView.setUint16(32, 0, true);
+    cView.setUint16(34, 0, true);
+    cView.setUint16(36, 0, true);
+    cView.setUint32(38, 0, true);
+    cView.setUint32(42, offset, true);
     ch.set(nameBytes, 46);
     centralHeaders.push(ch);
 
@@ -142,17 +186,16 @@ export function buildZip(entries: ZipEntry[]): Uint8Array {
   const centralDirOffset = offset;
   const centralDirSize = centralHeaders.reduce((acc, h) => acc + h.length, 0);
 
-  // End of central directory record (22 bytes)
   const eocd = new Uint8Array(22);
   const eView = new DataView(eocd.buffer);
-  eView.setUint32(0, 0x06054b50, true); // EOCD signature
-  eView.setUint16(4, 0, true); // Number of this disk
-  eView.setUint16(6, 0, true); // Disk with central directory
-  eView.setUint16(8, entries.length, true); // Total entries on this disk
-  eView.setUint16(10, entries.length, true); // Total entries
-  eView.setUint32(12, centralDirSize, true); // Size of central directory
-  eView.setUint32(16, centralDirOffset, true); // Offset of start of central directory
-  eView.setUint16(20, 0, true); // Comment length
+  eView.setUint32(0, 0x06054b50, true);
+  eView.setUint16(4, 0, true);
+  eView.setUint16(6, 0, true);
+  eView.setUint16(8, entries.length, true);
+  eView.setUint16(10, entries.length, true);
+  eView.setUint32(12, centralDirSize, true);
+  eView.setUint32(16, centralDirOffset, true);
+  eView.setUint16(20, 0, true);
 
   const totalLength = offset + centralDirSize + 22;
   const result = new Uint8Array(totalLength);
@@ -170,25 +213,12 @@ export function buildZip(entries: ZipEntry[]): Uint8Array {
   return result;
 }
 
-export function escapeXml(str: string): string {
-  if (!str) return "";
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-/**
- * Robust Central-Directory-first ZIP decompression and file extractor
- */
-async function decompressZipEntry(
+async function decompressZipEntryBytes(
   compData: Uint8Array,
   compMethod: number
-): Promise<string> {
+): Promise<Uint8Array> {
   if (compMethod === 0) {
-    return new TextDecoder("utf-8").decode(compData);
+    return compData;
   }
 
   if (compMethod === 8 && typeof DecompressionStream !== "undefined") {
@@ -196,31 +226,81 @@ async function decompressZipEntry(
       const stream = new Blob([compData as BlobPart])
         .stream()
         .pipeThrough(new DecompressionStream("deflate-raw"));
-      return await new Response(stream).text();
+      const buffer = await new Response(stream).arrayBuffer();
+      return new Uint8Array(buffer);
     } catch {
       try {
         const stream = new Blob([compData as BlobPart])
           .stream()
           .pipeThrough(new DecompressionStream("deflate"));
-        return await new Response(stream).text();
+        const buffer = await new Response(stream).arrayBuffer();
+        return new Uint8Array(buffer);
       } catch (err) {
         console.warn("DecompressionStream error in docx:", err);
       }
     }
   }
 
-  return "";
+  return compData;
+}
+
+export interface ExtractedDocxPackage {
+  documentXml: string;
+  relsXml: string;
+  mediaFiles: Map<string, Uint8Array>;
 }
 
 /**
- * Extract raw XML string of word/document.xml from a .docx buffer
+ * Universal media file resolver handling relative paths, prefixes and bare names
  */
-export async function extractWordDocumentXml(buffer: ArrayBuffer): Promise<string> {
+export function resolveMediaFile(
+  target: string,
+  mediaFiles: Map<string, Uint8Array>
+): Uint8Array | undefined {
+  if (!target) return undefined;
+
+  const normalized = target
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/^word\//, "")
+    .replace(/^(\.\.\/)+/, "");
+
+  const candidates = [
+    normalized,
+    `media/${normalized}`,
+    `word/${normalized}`,
+  ];
+
+  // Also match by filename as a final fallback
+  const fileName = normalized.split("/").pop();
+  if (fileName) {
+    candidates.push(`media/${fileName}`);
+    candidates.push(`word/media/${fileName}`);
+    candidates.push(fileName);
+  }
+
+  for (const key of candidates) {
+    const data = mediaFiles.get(key);
+    if (data) return data;
+  }
+
+  return undefined;
+}
+
+/**
+ * Robust Central-Directory-first ZIP decompression and package extractor
+ */
+export async function extractDocxPackage(buffer: ArrayBuffer): Promise<ExtractedDocxPackage> {
+  const result: ExtractedDocxPackage = {
+    documentXml: "",
+    relsXml: "",
+    mediaFiles: new Map(),
+  };
+
   try {
     const bytes = new Uint8Array(buffer);
     const view = new DataView(buffer);
 
-    // 1. Central Directory EOCD scan
     let eocdOffset = -1;
     const maxSearch = Math.max(0, bytes.length - 65557);
     for (let i = bytes.length - 22; i >= maxSearch; i--) {
@@ -248,7 +328,13 @@ export async function extractWordDocumentXml(buffer: ArrayBuffer): Promise<strin
         const nameBytes = bytes.subarray(entryPos + 46, entryPos + 46 + nameLen);
         const filename = new TextDecoder().decode(nameBytes);
 
-        if (filename === "word/document.xml" || filename.endsWith("document.xml")) {
+        if (
+          filename === "word/document.xml" ||
+          filename.endsWith("document.xml") ||
+          filename.includes("_rels/") ||
+          filename.includes("media/") ||
+          /\.(png|jpe?g|gif|webp|bmp|emf|wmf|svg)$/i.test(filename)
+        ) {
           if (view.getUint32(localHeaderOffset, true) === 0x04034b50) {
             const localNameLen = view.getUint16(localHeaderOffset + 26, true);
             const localExtraLen = view.getUint16(localHeaderOffset + 28, true);
@@ -256,77 +342,170 @@ export async function extractWordDocumentXml(buffer: ArrayBuffer): Promise<strin
             const dataEnd = dataStart + compSize;
 
             const compData = bytes.subarray(dataStart, dataEnd);
-            const xmlText = await decompressZipEntry(compData, compMethod);
-            if (xmlText) return xmlText;
+            const uncomp = await decompressZipEntryBytes(compData, compMethod);
+
+            if (filename === "word/document.xml" || filename.endsWith("document.xml")) {
+              result.documentXml = new TextDecoder("utf-8").decode(uncomp);
+            } else if (filename.includes("_rels/")) {
+              const relText = new TextDecoder("utf-8").decode(uncomp);
+              result.relsXml = (result.relsXml ? result.relsXml + "\n" : "") + relText;
+            } else {
+              const cleanName = filename.replace(/^word\//, "");
+              result.mediaFiles.set(cleanName, uncomp);
+              result.mediaFiles.set(filename, uncomp);
+              const bareName = cleanName.split("/").pop();
+              if (bareName) {
+                result.mediaFiles.set(bareName, uncomp);
+                result.mediaFiles.set(`media/${bareName}`, uncomp);
+                result.mediaFiles.set(`word/media/${bareName}`, uncomp);
+              }
+            }
           }
         }
 
         entryPos += 46 + nameLen + extraLen + commentLen;
       }
     }
-
-    // 2. Sequential Local Header Scan Fallback
-    let offset = 0;
-    while (offset < bytes.length - 30) {
-      if (view.getUint32(offset, true) === 0x04034b50) {
-        const compMethod = view.getUint16(offset + 8, true);
-        let compSize = view.getUint32(offset + 18, true);
-        const nameLen = view.getUint16(offset + 26, true);
-        const extraLen = view.getUint16(offset + 28, true);
-
-        const nameBytes = bytes.subarray(offset + 30, offset + 30 + nameLen);
-        const filename = new TextDecoder().decode(nameBytes);
-        const dataStart = offset + 30 + nameLen + extraLen;
-
-        if (filename === "word/document.xml" || filename.endsWith("document.xml")) {
-          if (compSize === 0) {
-            let nextSig = dataStart;
-            while (nextSig < bytes.length - 4) {
-              const sig = view.getUint32(nextSig, true);
-              if (sig === 0x04034b50 || sig === 0x02014b50 || sig === 0x08074b50) break;
-              nextSig++;
-            }
-            compSize = nextSig - dataStart;
-          }
-
-          const dataEnd = dataStart + compSize;
-          const compData = bytes.subarray(dataStart, dataEnd);
-          const xmlText = await decompressZipEntry(compData, compMethod);
-          if (xmlText) return xmlText;
-        }
-
-        offset = (dataStart + (compSize || 1)) > offset ? (dataStart + (compSize || 1)) : offset + 1;
-      } else {
-        offset++;
-      }
-    }
   } catch (e) {
-    console.warn("Error reading word/document.xml:", e);
+    console.warn("Error extracting DOCX package:", e);
   }
-  return "";
+
+  return result;
+}
+
+export async function extractWordDocumentXml(buffer: ArrayBuffer): Promise<string> {
+  const pkg = await extractDocxPackage(buffer);
+  return pkg.documentXml;
 }
 
 // ==========================================
 // OpenXML Parsing to Structured Document Model
 // ==========================================
 
-/**
- * Parse an OpenXML paragraph (<w:p>) XML fragment into a DocxParagraphBlock
- */
-function parseParagraphXml(pXml: string): DocxParagraphBlock {
-  // 1. Paragraph Properties (<w:pPr>)
+function parseSectionProps(sectPrXml: string): {
+  pageSize: { width: number; height: number };
+  margins: { top: number; right: number; bottom: number; left: number };
+  orientation?: "portrait" | "landscape";
+} {
+  let pageWidth = 595.28; // Default A4 in pt
+  let pageHeight = 841.89;
+  let marginTop = 54;
+  let marginRight = 54;
+  let marginBottom = 54;
+  let marginLeft = 54;
+  let orientation: "portrait" | "landscape" = "portrait";
+
+  const pgSzMatch = sectPrXml.match(/<w:pgSz\s+([^>]*)\/>/);
+  if (pgSzMatch) {
+    const attrs = pgSzMatch[1];
+    const wMatch = attrs.match(/w:w="(\d+)"/);
+    const hMatch = attrs.match(/w:h="(\d+)"/);
+    const orientMatch = attrs.match(/w:orient="([a-zA-Z]+)"/);
+    if (wMatch) pageWidth = parseInt(wMatch[1], 10) / 20;
+    if (hMatch) pageHeight = parseInt(hMatch[1], 10) / 20;
+    if (orientMatch && orientMatch[1].toLowerCase() === "landscape") {
+      orientation = "landscape";
+    }
+  }
+
+  const pgMarMatch = sectPrXml.match(/<w:pgMar\s+([^>]*)\/>/);
+  if (pgMarMatch) {
+    const attrs = pgMarMatch[1];
+    const topM = attrs.match(/w:top="(\d+)"/);
+    const rightM = attrs.match(/w:right="(\d+)"/);
+    const botM = attrs.match(/w:bottom="(\d+)"/);
+    const leftM = attrs.match(/w:left="(\d+)"/);
+    if (topM) marginTop = parseInt(topM[1], 10) / 20;
+    if (rightM) marginRight = parseInt(rightM[1], 10) / 20;
+    if (botM) marginBottom = parseInt(botM[1], 10) / 20;
+    if (leftM) marginLeft = parseInt(leftM[1], 10) / 20;
+  }
+
+  return {
+    pageSize: { width: pageWidth, height: pageHeight },
+    margins: { top: marginTop, right: marginRight, bottom: marginBottom, left: marginLeft },
+    orientation,
+  };
+}
+
+function parseParagraphXml(
+  pXml: string,
+  relMap: Map<string, string>,
+  mediaFiles: Map<string, Uint8Array>
+): DocxBlock[] {
+  const blocks: DocxBlock[] = [];
+
+  // Check if paragraph contains any embedded DrawingML or VML Images
+  const drawingMatches = [
+    ...(pXml.match(/<w:drawing\b[\s\S]*?<\/w:drawing>/gi) || []),
+    ...(pXml.match(/<w:pict\b[\s\S]*?<\/w:pict>/gi) || []),
+    ...(pXml.match(/<a:blip\b[\s\S]*?\/>/gi) || []),
+    ...(pXml.match(/<v:imagedata\b[\s\S]*?\/>/gi) || []),
+  ];
+
+  if (drawingMatches.length > 0) {
+    for (const dXml of drawingMatches) {
+      const blipMatch = dXml.match(/(?:r:embed|r:id|r:href|o:relid|embed|src|id)="([^"]+)"/i);
+      if (blipMatch) {
+        const rId = blipMatch[1];
+        const target = relMap.get(rId) || rId;
+        let imgBytes = resolveMediaFile(target, mediaFiles);
+        if (!imgBytes) {
+          imgBytes = resolveMediaFile(rId, mediaFiles);
+        }
+        if (imgBytes) {
+          let width = 380;
+          let height = 240;
+          const extMatch = dXml.match(/<wp:extent\s+[^>]*cx="(\d+)"[^>]*cy="(\d+)"/i);
+          if (extMatch) {
+            width = Math.round(parseInt(extMatch[1], 10) / 12700);
+            height = Math.round(parseInt(extMatch[2], 10) / 12700);
+          } else {
+            const styleMatch = dXml.match(/style="[^"]*width:(\d+(?:\.\d+)?)(pt|in|px)?[^"]*height:(\d+(?:\.\d+)?)(pt|in|px)?/i);
+            if (styleMatch) {
+              let w = parseFloat(styleMatch[1]);
+              let h = parseFloat(styleMatch[3]);
+              if (styleMatch[2] === "in") { w *= 72; h *= 72; }
+              else if (styleMatch[2] === "px") { w *= 0.75; h *= 0.75; }
+              width = Math.round(w);
+              height = Math.round(h);
+            }
+          }
+          const isPng = (target && target.toLowerCase().endsWith(".png")) || imgBytes[0] === 0x89;
+          blocks.push({
+            type: "image",
+            data: imgBytes,
+            mimeType: isPng ? "image/png" : "image/jpeg",
+            width: width > 0 ? width : 200,
+            height: height > 0 ? height : 200,
+            altText: "Word Embedded Image",
+          });
+        }
+      }
+    }
+  }
+
   let alignment: "left" | "center" | "right" | "justify" = "left";
   let isHeading = false;
   let headingLevel = 1;
   let isListItem = false;
   let spacingBefore = 0;
   let spacingAfter = 4;
+  let lineSpacing: number | undefined;
+  let leftIndent: number | undefined;
+  let rightIndent: number | undefined;
+  let firstLineIndent: number | undefined;
+  let hangingIndent: number | undefined;
+  let pageBreakBefore = false;
 
   const pPrMatch = pXml.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/);
   if (pPrMatch) {
     const pPr = pPrMatch[0];
 
-    // Alignment
+    if (/<w:pageBreakBefore\/>/i.test(pPr)) {
+      pageBreakBefore = true;
+    }
+
     const jcMatch = pPr.match(/<w:jc\s+w:val="([a-zA-Z]+)"/);
     if (jcMatch) {
       const val = jcMatch[1].toLowerCase();
@@ -335,21 +514,20 @@ function parseParagraphXml(pXml: string): DocxParagraphBlock {
       else if (val === "both" || val === "justify") alignment = "justify";
     }
 
-    // Heading style
-    const styleMatch = pPr.match(/<w:pStyle\s+w:val="([a-zA-Z0-9_-]+)"/i);
+    const styleMatch = pPr.match(/<w:pStyle\s+w:val="([^"]+)"/i);
     if (styleMatch) {
       const sVal = styleMatch[1].toLowerCase();
-      if (sVal.includes("heading1") || sVal === "title") {
+      if (sVal.includes("heading1") || sVal.includes("head1") || sVal === "title" || sVal.includes("titre1")) {
         isHeading = true;
         headingLevel = 1;
-        spacingBefore = 12;
+        spacingBefore = 14;
         spacingAfter = 6;
-      } else if (sVal.includes("heading2") || sVal === "subtitle") {
+      } else if (sVal.includes("heading2") || sVal.includes("head2") || sVal === "subtitle" || sVal.includes("titre2")) {
         isHeading = true;
         headingLevel = 2;
         spacingBefore = 10;
         spacingAfter = 4;
-      } else if (sVal.includes("heading3")) {
+      } else if (sVal.includes("heading") || sVal.includes("head") || sVal.includes("titre")) {
         isHeading = true;
         headingLevel = 3;
         spacingBefore = 8;
@@ -357,22 +535,50 @@ function parseParagraphXml(pXml: string): DocxParagraphBlock {
       }
     }
 
-    // List item
     if (/<w:numPr\b/i.test(pPr)) {
       isListItem = true;
     }
 
-    // Spacing
+    // Paragraph Indentation
+    const indMatch = pPr.match(/<w:ind\b([^>]*)\/>/);
+    if (indMatch) {
+      const attrs = indMatch[1];
+      const leftM = attrs.match(/w:left="(\d+)"/);
+      const rightM = attrs.match(/w:right="(\d+)"/);
+      const firstLineM = attrs.match(/w:firstLine="(\d+)"/);
+      const hangingM = attrs.match(/w:hanging="(\d+)"/);
+      if (leftM) leftIndent = Math.round(parseInt(leftM[1], 10) / 20);
+      if (rightM) rightIndent = Math.round(parseInt(rightM[1], 10) / 20);
+      if (firstLineM) firstLineIndent = Math.round(parseInt(firstLineM[1], 10) / 20);
+      if (hangingM) hangingIndent = Math.round(parseInt(hangingM[1], 10) / 20);
+    }
+
+    // Spacing Before, After, and Line Spacing
     const spMatch = pPr.match(/<w:spacing\b([^>]*)\/>/);
     if (spMatch) {
-      const beforeMatch = spMatch[1].match(/w:before="(\d+)"/);
-      const afterMatch = spMatch[1].match(/w:after="(\d+)"/);
-      if (beforeMatch) spacingBefore = Math.round(parseInt(beforeMatch[1], 10) / 20); // 1 pt = 20 twips
+      const attrs = spMatch[1];
+      const beforeMatch = attrs.match(/w:before="(\d+)"/);
+      const afterMatch = attrs.match(/w:after="(\d+)"/);
+      const lineMatch = attrs.match(/w:line="(\d+)"/);
+      const lineRuleMatch = attrs.match(/w:lineRule="([a-zA-Z]+)"/);
+
+      if (beforeMatch) spacingBefore = Math.round(parseInt(beforeMatch[1], 10) / 20);
       if (afterMatch) spacingAfter = Math.round(parseInt(afterMatch[1], 10) / 20);
+
+      if (lineMatch) {
+        const lineVal = parseInt(lineMatch[1], 10);
+        const lineRule = lineRuleMatch ? lineRuleMatch[1].toLowerCase() : "auto";
+        if (lineRule === "exact" || lineRule === "atleast") {
+          lineSpacing = lineVal / 20;
+        } else {
+          const multiple = lineVal / 240;
+          lineSpacing = multiple * 14;
+        }
+      }
     }
   }
 
-  // 2. Parse Text Runs (<w:r>)
+  // Parse Text Runs (<w:r>)
   const runs: DocxTextRun[] = [];
   const runMatches = pXml.match(/<w:r\b[\s\S]*?<\/w:r>/g);
 
@@ -381,8 +587,12 @@ function parseParagraphXml(pXml: string): DocxParagraphBlock {
       let bold = false;
       let italic = false;
       let underline = false;
+      let strike = false;
+      let superscript = false;
+      let subscript = false;
       let fontSize: number | undefined;
       let color: string | undefined;
+      let highlight: string | undefined;
       let fontFamily: string | undefined;
 
       const rPrMatch = rXml.match(/<w:rPr\b[\s\S]*?<\/w:rPr>/);
@@ -397,27 +607,38 @@ function parseParagraphXml(pXml: string): DocxParagraphBlock {
         if (/<w:u\b/i.test(rPr) && !/<w:u\s+w:val="none"/i.test(rPr)) {
           underline = true;
         }
+        if (/<w:strike\b/i.test(rPr) || /<w:dstrike\b/i.test(rPr)) {
+          strike = true;
+        }
 
-        // Font size: stored in half-points (e.g. 24 = 12pt)
+        const vertAlignMatch = rPr.match(/<w:vertAlign\s+w:val="([a-zA-Z]+)"/i);
+        if (vertAlignMatch) {
+          const va = vertAlignMatch[1].toLowerCase();
+          if (va === "superscript") superscript = true;
+          else if (va === "subscript") subscript = true;
+        }
+
+        const hlMatch = rPr.match(/<w:highlight\s+w:val="([a-zA-Z0-9]+)"/i);
+        if (hlMatch && hlMatch[1].toLowerCase() !== "none") {
+          highlight = hlMatch[1];
+        }
+
         const szMatch = rPr.match(/<w:sz\s+w:val="(\d+)"/);
         if (szMatch) {
           fontSize = parseInt(szMatch[1], 10) / 2;
         }
 
-        // Color
         const colorMatch = rPr.match(/<w:color\s+w:val="([0-9a-fA-F]{6})"/);
         if (colorMatch && colorMatch[1].toUpperCase() !== "AUTO") {
           color = `#${colorMatch[1]}`;
         }
 
-        // Font family
         const fontMatch = rPr.match(/<w:rFonts\s+[^>]*w:ascii="([^"]+)"/);
         if (fontMatch) {
           fontFamily = fontMatch[1];
         }
       }
 
-      // Extract text, tabs, line breaks inside the run
       const tokenMatches = rXml.match(/<w:t\b[\s\S]*?>([\s\S]*?)<\/w:t>|<w:tab\/>|<w:br\/>/g);
       let runText = "";
       if (tokenMatches) {
@@ -427,8 +648,8 @@ function parseParagraphXml(pXml: string): DocxParagraphBlock {
           } else if (token === "<w:br/>") {
             runText += "\n";
           } else {
-            const clean = token.replace(/<[^>]+>/g, "");
-            runText += clean;
+            const rawInner = token.replace(/<[^>]+>/g, "");
+            runText += decodeXmlEntities(rawInner);
           }
         }
       }
@@ -439,44 +660,95 @@ function parseParagraphXml(pXml: string): DocxParagraphBlock {
           bold,
           italic,
           underline,
+          strike,
+          superscript,
+          subscript,
           fontSize,
           color,
+          highlight,
           fontFamily,
         });
       }
     }
   }
 
-  // If no runs but plain text exists
   if (runs.length === 0) {
     const rawTextMatches = pXml.match(/<w:t\b[\s\S]*?>([\s\S]*?)<\/w:t>/g);
     if (rawTextMatches) {
-      const full = rawTextMatches.map((m) => m.replace(/<[^>]+>/g, "")).join("");
+      const full = rawTextMatches.map((m) => decodeXmlEntities(m.replace(/<[^>]+>/g, ""))).join("");
       if (full.trim()) {
         runs.push({ text: full });
       }
     }
   }
 
-  return {
-    type: "paragraph",
-    runs,
-    alignment,
-    isHeading,
-    headingLevel,
-    isListItem,
-    spacingBefore,
-    spacingAfter,
-  };
+  if (runs.length > 0) {
+    // Detect direct-formatted Headings (large font size or uppercase section title)
+    const totalText = runs.map((r) => r.text).join("").trim();
+    const maxRunFontSize = Math.max(0, ...runs.map((r) => r.fontSize || 0));
+    const allRunsBold = runs.every((r) => r.bold || !r.text.trim());
+    const isUppercaseHeader =
+      /^[A-Z0-9\s&/,\-–—|]{4,60}$/.test(totalText) &&
+      (allRunsBold || maxRunFontSize >= 11) &&
+      !totalText.includes("@") &&
+      !totalText.includes(".com");
+
+    if (!isHeading && totalText.length > 0 && totalText.length < 80) {
+      if (maxRunFontSize >= 16) {
+        isHeading = true;
+        headingLevel = 1;
+        spacingBefore = 14;
+        spacingAfter = 6;
+      } else if (maxRunFontSize >= 13 || (allRunsBold && maxRunFontSize >= 11.5) || isUppercaseHeader) {
+        isHeading = true;
+        headingLevel = 2;
+        spacingBefore = 10;
+        spacingAfter = 4;
+      }
+    }
+
+    blocks.push({
+      type: "paragraph",
+      runs,
+      alignment,
+      isHeading,
+      headingLevel,
+      isListItem,
+      spacingBefore,
+      spacingAfter,
+      lineSpacing,
+      leftIndent,
+      rightIndent,
+      firstLineIndent,
+      hangingIndent,
+      pageBreakBefore,
+    });
+  }
+
+  return blocks;
 }
 
-/**
- * Parse an OpenXML table (<w:tbl>) XML fragment into a DocxTableBlock
- */
-function parseTableXml(tblXml: string): DocxTableBlock {
+function parseTableXml(
+  tblXml: string,
+  relMap: Map<string, string>,
+  mediaFiles: Map<string, Uint8Array>
+): DocxTableBlock {
   const rows: DocxTableRow[] = [];
-  const trMatches = tblXml.match(/<w:tr\b[\s\S]*?<\/w:tr>/g);
 
+  // Extract column grid widths from <w:tblGrid>
+  const colWidths: number[] = [];
+  const gridMatch = tblXml.match(/<w:tblGrid\b[\s\S]*?<\/w:tblGrid>/);
+  if (gridMatch) {
+    const colMatches = gridMatch[0].match(/<w:gridCol\s+[^>]*w:w="(\d+)"/g);
+    if (colMatches) {
+      for (const col of colMatches) {
+        const wVal = col.match(/w:w="(\d+)"/);
+        if (wVal) colWidths.push(Math.round(parseInt(wVal[1], 10) / 20));
+      }
+    }
+  }
+
+  const trMatches = tblXml.match(/<w:tr\b[\s\S]*?<\/w:tr>/g);
   if (trMatches) {
     for (let rIdx = 0; rIdx < trMatches.length; rIdx++) {
       const trXml = trMatches[rIdx];
@@ -488,32 +760,40 @@ function parseTableXml(tblXml: string): DocxTableBlock {
         for (const tcXml of tcMatches) {
           let bgColor: string | undefined;
           let width: number | undefined;
+          let colSpan = 1;
+          let rowSpan = 1;
 
-          // Shading / Background color
           const shdMatch = tcXml.match(/<w:shd\s+[^>]*w:fill="([0-9a-fA-F]{6})"/i);
           if (shdMatch && shdMatch[1].toUpperCase() !== "AUTO") {
             bgColor = `#${shdMatch[1]}`;
           }
 
-          // Cell width in twips
           const wMatch = tcXml.match(/<w:tcW\s+[^>]*w:w="(\d+)"/);
           if (wMatch) {
-            width = Math.round(parseInt(wMatch[1], 10) / 20); // convert twips to pt
+            width = Math.round(parseInt(wMatch[1], 10) / 20);
           }
 
-          // Cell paragraphs
+          const spanMatch = tcXml.match(/<w:gridSpan\s+[^>]*w:val="(\d+)"/);
+          if (spanMatch) {
+            colSpan = parseInt(spanMatch[1], 10);
+          }
+
           const cellBlocks: DocxParagraphBlock[] = [];
           const cellPMatches = tcXml.match(/<w:p\b[\s\S]*?<\/w:p>/g);
           if (cellPMatches) {
             for (const cellP of cellPMatches) {
-              const parsedP = parseParagraphXml(cellP);
-              cellBlocks.push(parsedP);
+              const parsed = parseParagraphXml(cellP, relMap, mediaFiles);
+              for (const b of parsed) {
+                if (b.type === "paragraph") cellBlocks.push(b);
+              }
             }
           }
 
           if (cellBlocks.length === 0) {
             const tMatches = tcXml.match(/<w:t\b[\s\S]*?>([\s\S]*?)<\/w:t>/g);
-            const str = tMatches ? tMatches.map((t) => t.replace(/<[^>]+>/g, "")).join("").trim() : "";
+            const str = tMatches
+              ? tMatches.map((t) => decodeXmlEntities(t.replace(/<[^>]+>/g, ""))).join("").trim()
+              : "";
             cellBlocks.push({
               type: "paragraph",
               runs: [{ text: str }],
@@ -525,6 +805,8 @@ function parseTableXml(tblXml: string): DocxTableBlock {
             blocks: cellBlocks,
             width,
             bgColor,
+            colSpan,
+            rowSpan,
           });
         }
       }
@@ -538,17 +820,16 @@ function parseTableXml(tblXml: string): DocxTableBlock {
   return {
     type: "table",
     rows,
+    colWidths: colWidths.length > 0 ? colWidths : undefined,
     hasHeader: rows.some((r) => r.isHeader),
   };
 }
 
-/**
- * Parses a Word .docx buffer into a high-fidelity DocumentModel
- */
 export async function parseDocxToDocumentModel(buffer: ArrayBuffer): Promise<DocumentModel> {
-  const xmlStr = await extractWordDocumentXml(buffer);
+  const pkg = await extractDocxPackage(buffer);
+  const xmlStr = pkg.documentXml;
+
   if (!xmlStr) {
-    // Fallback: create single paragraph from extracted text
     const plainText = await extractTextFromDocx(buffer);
     const lines = plainText.split(/\r?\n/).filter(Boolean);
     const blocks: DocxParagraphBlock[] = lines.map((l) => {
@@ -565,7 +846,7 @@ export async function parseDocxToDocumentModel(buffer: ArrayBuffer): Promise<Doc
     return {
       sections: [
         {
-          pageSize: { width: 595.28, height: 841.89 }, // A4
+          pageSize: { width: 595.28, height: 841.89 },
           margins: { top: 54, right: 54, bottom: 54, left: 54 },
           blocks,
         },
@@ -573,78 +854,95 @@ export async function parseDocxToDocumentModel(buffer: ArrayBuffer): Promise<Doc
     };
   }
 
-  // Parse Section Properties (<w:sectPr>) for page size and margins
-  let pageWidth = 595.28; // Default A4 in pt
-  let pageHeight = 841.89;
-  let marginTop = 54;
-  let marginRight = 54;
-  let marginBottom = 54;
-  let marginLeft = 54;
-
-  const sectPrMatch = xmlStr.match(/<w:sectPr\b[\s\S]*?<\/w:sectPr>/);
-  if (sectPrMatch) {
-    const sectPr = sectPrMatch[0];
-    const pgSzMatch = sectPr.match(/<w:pgSz\s+[^>]*w:w="(\d+)"[^>]*w:h="(\d+)"/);
-    if (pgSzMatch) {
-      pageWidth = parseInt(pgSzMatch[1], 10) / 20;
-      pageHeight = parseInt(pgSzMatch[2], 10) / 20;
-    }
-    const pgMarMatch = sectPr.match(/<w:pgMar\s+([^>]*)\/>/);
-    if (pgMarMatch) {
-      const attrs = pgMarMatch[1];
-      const topM = attrs.match(/w:top="(\d+)"/);
-      const rightM = attrs.match(/w:right="(\d+)"/);
-      const botM = attrs.match(/w:bottom="(\d+)"/);
-      const leftM = attrs.match(/w:left="(\d+)"/);
-      if (topM) marginTop = parseInt(topM[1], 10) / 20;
-      if (rightM) marginRight = parseInt(rightM[1], 10) / 20;
-      if (botM) marginBottom = parseInt(botM[1], 10) / 20;
-      if (leftM) marginLeft = parseInt(leftM[1], 10) / 20;
+  // Parse Relationship Map (rId -> media target)
+  const relMap = new Map<string, string>();
+  if (pkg.relsXml) {
+    const relMatches = pkg.relsXml.match(/<Relationship\b[\s\S]*?(?:\/>|<\/Relationship>)/gi);
+    if (relMatches) {
+      for (const r of relMatches) {
+        const idMatch = r.match(/Id="([^"]+)"/i);
+        const targetMatch = r.match(/Target="([^"]+)"/i);
+        if (idMatch && targetMatch) {
+          relMap.set(idMatch[1], targetMatch[1]);
+        }
+      }
     }
   }
 
-  // Match top-level blocks in <w:body> (<w:p> and <w:tbl>)
-  const blocks: DocxBlock[] = [];
   const bodyMatch = xmlStr.match(/<w:body\b[\s\S]*?<\/w:body>/);
   const bodyContent = bodyMatch ? bodyMatch[0] : xmlStr;
 
+  const sections: DocxSection[] = [];
+  let currentSectionBlocks: DocxBlock[] = [];
+
+  // Match blocks in sequence
   const blockRegex = /<w:p\b[\s\S]*?<\/w:p>|<w:tbl\b[\s\S]*?<\/w:tbl>/g;
   let match: RegExpExecArray | null;
 
   while ((match = blockRegex.exec(bodyContent)) !== null) {
     const blockXml = match[0];
     if (blockXml.startsWith("<w:p")) {
-      const para = parseParagraphXml(blockXml);
-      const hasContent = para.runs.some((r) => r.text && r.text.trim().length > 0);
-      if (hasContent) {
-        blocks.push(para);
+      const parsedBlocks = parseParagraphXml(blockXml, relMap, pkg.mediaFiles);
+      currentSectionBlocks.push(...parsedBlocks);
+
+      // Check for inline section break <w:pPr><w:sectPr>...</w:sectPr></w:pPr>
+      const sectMatch = blockXml.match(/<w:pPr\b[\s\S]*?<w:sectPr\b[\s\S]*?<\/w:sectPr>[\s\S]*?<\/w:pPr>/);
+      if (sectMatch) {
+        const secProps = parseSectionProps(sectMatch[0]);
+        sections.push({
+          pageSize: secProps.pageSize,
+          margins: secProps.margins,
+          orientation: secProps.orientation,
+          blocks: currentSectionBlocks,
+        });
+        currentSectionBlocks = [];
       }
     } else if (blockXml.startsWith("<w:tbl")) {
-      const tbl = parseTableXml(blockXml);
+      const tbl = parseTableXml(blockXml, relMap, pkg.mediaFiles);
       if (tbl.rows.length > 0) {
-        blocks.push(tbl);
+        currentSectionBlocks.push(tbl);
       }
     }
   }
 
+  // Final section properties at end of body
+  let finalSecProps: {
+    pageSize: { width: number; height: number };
+    margins: { top: number; right: number; bottom: number; left: number };
+    orientation?: "portrait" | "landscape";
+  } = {
+    pageSize: { width: 595.28, height: 841.89 },
+    margins: { top: 54, right: 54, bottom: 54, left: 54 },
+    orientation: "portrait",
+  };
+  const bodyEndSect = bodyContent.match(/<w:sectPr\b[\s\S]*?<\/w:sectPr>(?=\s*<\/w:body>|$)/);
+  if (bodyEndSect) {
+    finalSecProps = parseSectionProps(bodyEndSect[0]);
+  }
+
+  sections.push({
+    pageSize: finalSecProps.pageSize,
+    margins: finalSecProps.margins,
+    orientation: finalSecProps.orientation,
+    blocks: currentSectionBlocks,
+  });
+
   return {
-    sections: [
+    sections: sections.length > 0 ? sections : [
       {
-        pageSize: { width: pageWidth, height: pageHeight },
-        margins: { top: marginTop, right: marginRight, bottom: marginBottom, left: marginLeft },
-        blocks,
-      },
+        pageSize: finalSecProps.pageSize,
+        margins: finalSecProps.margins,
+        blocks: [],
+      }
     ],
   };
 }
 
-/**
- * Extract clean, structured text representation from Word .docx
- */
 export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> {
-  const xmlStr = await extractWordDocumentXml(buffer);
+  const pkg = await extractDocxPackage(buffer);
+  const xmlStr = pkg.documentXml;
+
   if (!xmlStr) {
-    // Binary fallback for legacy .doc or plain text
     try {
       const text = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(buffer));
       const textBlocks = text.match(/[\x20-\x7E\xA0-\xFF\t\r\n]{4,}/g) || [];
@@ -668,7 +966,7 @@ export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> 
         if (cellMatches) {
           const cellTexts = cellMatches.map((cell) => {
             const tMatches = cell.match(/<w:t\b[\s\S]*?>([\s\S]*?)<\/w:t>/g) || [];
-            return tMatches.map((t) => t.replace(/<[^>]+>/g, "")).join("").trim();
+            return tMatches.map((t) => decodeXmlEntities(t.replace(/<[^>]+>/g, ""))).join("").trim();
           });
           const rowStr = cellTexts.filter(Boolean).join(" | ");
           if (rowStr.trim()) paragraphs.push(rowStr);
@@ -676,7 +974,6 @@ export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> 
         continue;
       }
 
-      // Paragraph
       let pText = "";
       const isHeading = /<w:pStyle\s+w:val="Heading(\d+)"/i.test(block) || /<w:pStyle\s+w:val="Title"/i.test(block);
       const isListItem = /<w:numPr>/i.test(block);
@@ -686,7 +983,7 @@ export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> 
         for (const token of tokens) {
           if (token === "<w:tab/>") pText += "\t";
           else if (token === "<w:br/>") pText += "\n";
-          else pText += token.replace(/<[^>]+>/g, "");
+          else pText += decodeXmlEntities(token.replace(/<[^>]+>/g, ""));
         }
       }
 
@@ -703,22 +1000,24 @@ export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> 
 }
 
 // ==========================================
-// OpenXML Generator: PDF / Text to .DOCX
+// OpenXML Generator: PDF / Text to .DOCX with DrawingML Images
 // ==========================================
 
-/**
- * Generate a complete, valid Microsoft Word (.docx) OpenXML package
- */
 export function generateRealDocxBlob(
   title: string,
   contentOrModel: string | DocumentModel
 ): Blob {
   const encoder = new TextEncoder();
+  const imageEntries: ZipEntry[] = [];
+  const imageRelationships: string[] = [];
 
   const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="jpeg" ContentType="image/jpeg"/>
+  <Default Extension="jpg" ContentType="image/jpeg"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
 </Types>`;
@@ -726,11 +1025,6 @@ export function generateRealDocxBlob(
   const relsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>`;
-
-  const wordRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>`;
 
   const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -745,14 +1039,19 @@ export function generateRealDocxBlob(
       </w:rPr>
     </w:rPrDefault>
   </w:docDefaults>
+  <w:style w:type="paragraph" w:styleId="Normal" w:default="1">
+    <w:name w:val="Normal"/>
+    <w:pPr><w:spacing w:after="140" w:line="260" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:sz w:val="22"/><w:color w:val="1E293B"/></w:rPr>
+  </w:style>
   <w:style w:type="paragraph" w:styleId="Heading1">
     <w:name w:val="heading 1"/>
-    <w:pPr><w:spacing w:before="240" w:after="120"/></w:pPr>
+    <w:pPr><w:spacing w:before="260" w:after="120"/></w:pPr>
     <w:rPr><w:b/><w:sz w:val="32"/><w:color w:val="0F172A"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading2">
     <w:name w:val="heading 2"/>
-    <w:pPr><w:spacing w:before="180" w:after="100"/></w:pPr>
+    <w:pPr><w:spacing w:before="200" w:after="100"/></w:pPr>
     <w:rPr><w:b/><w:sz w:val="26"/><w:color w:val="1E293B"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading3">
@@ -763,6 +1062,7 @@ export function generateRealDocxBlob(
 </w:styles>`;
 
   const bodyXmlParts: string[] = [];
+  let imageCounter = 0;
 
   if (typeof contentOrModel === "string") {
     const lines = contentOrModel.split(/\r?\n/);
@@ -817,11 +1117,15 @@ export function generateRealDocxBlob(
       }
     }
   } else {
-    // Render from DocumentModel
-    for (const section of contentOrModel.sections) {
+    // Render from DocumentModel with Images, Tables, and Formatting
+    for (let sIdx = 0; sIdx < contentOrModel.sections.length; sIdx++) {
+      const section = contentOrModel.sections[sIdx];
       for (const block of section.blocks) {
         if (block.type === "paragraph") {
           const pPrElements: string[] = [];
+          if (block.pageBreakBefore || (block.isHeading && block.headingLevel === 1 && bodyXmlParts.length > 0)) {
+            pPrElements.push(`<w:pageBreakBefore/>`);
+          }
           if (block.alignment && block.alignment !== "left") {
             const jc = block.alignment === "justify" ? "both" : block.alignment;
             pPrElements.push(`<w:jc w:val="${jc}"/>`);
@@ -829,19 +1133,38 @@ export function generateRealDocxBlob(
           if (block.isHeading) {
             pPrElements.push(`<w:pStyle w:val="Heading${block.headingLevel || 1}"/>`);
           }
-          if (block.isListItem) {
-            pPrElements.push(`<w:ind w:left="400"/>`);
+
+          // Paragraph Indentation
+          const indParts: string[] = [];
+          if (block.leftIndent !== undefined) indParts.push(`w:left="${Math.round(block.leftIndent * 20)}"`);
+          if (block.rightIndent !== undefined) indParts.push(`w:right="${Math.round(block.rightIndent * 20)}"`);
+          if (block.firstLineIndent !== undefined) indParts.push(`w:firstLine="${Math.round(block.firstLineIndent * 20)}"`);
+          if (block.hangingIndent !== undefined) indParts.push(`w:hanging="${Math.round(block.hangingIndent * 20)}"`);
+          else if (block.isListItem && block.leftIndent === undefined) indParts.push(`w:left="400"`);
+          if (indParts.length > 0) {
+            pPrElements.push(`<w:ind ${indParts.join(" ")}/>`);
           }
+
+          // Spacing
           const before = (block.spacingBefore || 0) * 20;
-          const after = (block.spacingAfter || 6) * 20;
-          pPrElements.push(`<w:spacing w:before="${before}" w:after="${after}"/>`);
+          const after = (block.spacingAfter !== undefined ? block.spacingAfter : (block.isHeading ? 6 : 4)) * 20;
+          let spAttrs = `w:before="${before}" w:after="${after}"`;
+          if (block.lineSpacing && block.lineSpacing > 0) {
+            spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="exact"`;
+          }
+          pPrElements.push(`<w:spacing ${spAttrs}/>`);
 
           const runsXml = block.runs
             .map((r) => {
               const rPrParts: string[] = [];
+              if (r.fontFamily) rPrParts.push(`<w:rFonts w:ascii="${escapeXml(r.fontFamily)}" w:hAnsi="${escapeXml(r.fontFamily)}"/>`);
               if (r.bold) rPrParts.push("<w:b/>");
               if (r.italic) rPrParts.push("<w:i/>");
               if (r.underline) rPrParts.push('<w:u w:val="single"/>');
+              if (r.strike) rPrParts.push('<w:strike/>');
+              if (r.superscript) rPrParts.push('<w:vertAlign w:val="superscript"/>');
+              if (r.subscript) rPrParts.push('<w:vertAlign w:val="subscript"/>');
+              if (r.highlight) rPrParts.push(`<w:highlight w:val="${escapeXml(r.highlight)}"/>`);
               if (r.fontSize) rPrParts.push(`<w:sz w:val="${Math.round(r.fontSize * 2)}"/>`);
               if (r.color) {
                 const hex = r.color.replace("#", "");
@@ -855,7 +1178,8 @@ export function generateRealDocxBlob(
           const pPr = pPrElements.length > 0 ? `<w:pPr>${pPrElements.join("")}</w:pPr>` : "";
           bodyXmlParts.push(`<w:p>${pPr}${runsXml}</w:p>`);
         } else if (block.type === "table") {
-          const rowsXml = block.rows
+          const tbl = block as DocxTableBlock;
+          const rowsXml = tbl.rows
             .map((row) => {
               const cellsXml = row.cells
                 .map((cell) => {
@@ -866,12 +1190,29 @@ export function generateRealDocxBlob(
                   if (cell.width) {
                     tcPrParts.push(`<w:tcW w:w="${Math.round(cell.width * 20)}" w:type="dxa"/>`);
                   }
+                  if (cell.colSpan && cell.colSpan > 1) {
+                    tcPrParts.push(`<w:gridSpan w:val="${cell.colSpan}"/>`);
+                  }
                   tcPrParts.push(`<w:tcMar><w:top w:w="120"/><w:bottom w:w="120"/><w:left w:w="140"/><w:right w:w="140"/></w:tcMar>`);
 
                   const pContent = cell.blocks
                     .map((p) => {
                       const runs = p.runs
-                        .map((r) => `<w:r><w:rPr>${r.bold ? "<w:b/>" : ""}<w:sz w:val="20"/></w:rPr><w:t xml:space="preserve">${escapeXml(r.text)}</w:t></w:r>`)
+                        .map((r) => {
+                          const rPrParts: string[] = [];
+                          if (r.fontFamily) rPrParts.push(`<w:rFonts w:ascii="${escapeXml(r.fontFamily)}" w:hAnsi="${escapeXml(r.fontFamily)}"/>`);
+                          if (r.bold) rPrParts.push("<w:b/>");
+                          if (r.italic) rPrParts.push("<w:i/>");
+                          if (r.underline) rPrParts.push('<w:u w:val="single"/>');
+                          if (r.strike) rPrParts.push('<w:strike/>');
+                          if (r.superscript) rPrParts.push('<w:vertAlign w:val="superscript"/>');
+                          if (r.subscript) rPrParts.push('<w:vertAlign w:val="subscript"/>');
+                          if (r.highlight) rPrParts.push(`<w:highlight w:val="${escapeXml(r.highlight)}"/>`);
+                          if (r.fontSize) rPrParts.push(`<w:sz w:val="${Math.round(r.fontSize * 2)}"/>`);
+                          if (r.color) rPrParts.push(`<w:color w:val="${r.color.replace("#", "")}"/>`);
+                          const rPr = rPrParts.length > 0 ? `<w:rPr>${rPrParts.join("")}</w:rPr>` : "";
+                          return `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(r.text)}</w:t></w:r>`;
+                        })
                         .join("");
                       return `<w:p><w:pPr><w:spacing w:after="0"/></w:pPr>${runs}</w:p>`;
                     })
@@ -888,25 +1229,109 @@ export function generateRealDocxBlob(
             <w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/><w:insideV w:val="none"/></w:tblBorders></w:tblPr>
             ${rowsXml}
           </w:tbl>`);
+        } else if (block.type === "image") {
+          const img = block as DocxImageBlock;
+          imageCounter++;
+          const ext = img.mimeType === "image/png" ? "png" : "jpeg";
+          const imgFileName = `media/image${imageCounter}.${ext}`;
+          const rId = `rIdImg${imageCounter}`;
+
+          imageEntries.push({
+            name: `word/${imgFileName}`,
+            data: img.data,
+          });
+
+          imageRelationships.push(
+            `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${imgFileName}"/>`
+          );
+
+          const maxPtWidth = 460;
+          let ptWidth = img.width || 380;
+          let ptHeight = img.height || 260;
+          if (ptWidth > maxPtWidth) {
+            const scale = maxPtWidth / ptWidth;
+            ptWidth = maxPtWidth;
+            ptHeight = ptHeight * scale;
+          }
+
+          const emuWidth = Math.round(ptWidth * 12700);
+          const emuHeight = Math.round(ptHeight * 12700);
+          const imgAlign = ptWidth < 220 ? "left" : "center";
+
+          bodyXmlParts.push(`<w:p>
+            <w:pPr><w:jc w:val="${imgAlign}"/><w:spacing w:before="80" w:after="80"/></w:pPr>
+            <w:r>
+              <w:drawing>
+                <wp:inline distT="0" distB="0" distL="0" distR="0">
+                  <wp:extent cx="${emuWidth}" cy="${emuHeight}"/>
+                  <wp:effectExtent l="0" t="0" r="0" b="0"/>
+                  <wp:docPr id="${imageCounter}" name="Picture ${imageCounter}" descr="${escapeXml(img.altText || 'Document Image')}"/>
+                  <wp:cNvGraphicFramePr>
+                    <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
+                  </wp:cNvGraphicFramePr>
+                  <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                    <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                      <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                        <pic:nvPicPr>
+                          <pic:cNvPr id="${imageCounter}" name="Picture ${imageCounter}"/>
+                          <pic:cNvPicPr/>
+                        </pic:nvPicPr>
+                        <pic:blipFill>
+                          <a:blip r:embed="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
+                          <a:stretch><a:fillRect/></a:stretch>
+                        </pic:blipFill>
+                        <pic:spPr>
+                          <a:xfrm>
+                            <a:off x="0" y="0"/>
+                            <a:ext cx="${emuWidth}" cy="${emuHeight}"/>
+                          </a:xfrm>
+                          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                        </pic:spPr>
+                      </pic:pic>
+                    </a:graphicData>
+                  </a:graphic>
+                </wp:inline>
+              </w:drawing>
+            </w:r>
+          </w:p>`);
         }
       }
     }
   }
 
+  const wordRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  ${imageRelationships.join("\n  ")}
+</Relationships>`;
+
+  // Dynamic Section Properties (Page Size, Orientation, Margins)
+  const firstSec = typeof contentOrModel !== "string" && contentOrModel.sections && contentOrModel.sections[0]
+    ? contentOrModel.sections[0]
+    : undefined;
+  const pgW = firstSec?.pageSize?.width ? Math.round(firstSec.pageSize.width * 20) : 11906; // A4 pt -> dxa
+  const pgH = firstSec?.pageSize?.height ? Math.round(firstSec.pageSize.height * 20) : 16838;
+  const topM = firstSec?.margins?.top ? Math.round(firstSec.margins.top * 20) : 1080;
+  const rightM = firstSec?.margins?.right ? Math.round(firstSec.margins.right * 20) : 1080;
+  const botM = firstSec?.margins?.bottom ? Math.round(firstSec.margins.bottom * 20) : 1080;
+  const leftM = firstSec?.margins?.left ? Math.round(firstSec.margins.left * 20) : 1080;
+  const orientAttr = firstSec?.orientation === "landscape" ? ` w:orient="landscape"` : "";
+
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:document 
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+  xmlns:v="urn:schemas-microsoft-com:vml"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+  xmlns:w10="urn:schemas-microsoft-com:office:word"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
   <w:body>
-    <w:p>
-      <w:pPr><w:spacing w:after="200"/></w:pPr>
-      <w:r>
-        <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:b/><w:sz w:val="36"/><w:color w:val="0F172A"/></w:rPr>
-        <w:t>${escapeXml(title)}</w:t>
-      </w:r>
-    </w:p>
     ${bodyXmlParts.join("")}
     <w:sectPr>
-      <w:pgSz w:w="12240" w:h="15840"/>
-      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>
+      <w:pgSz w:w="${pgW}" w:h="${pgH}"${orientAttr}/>
+      <w:pgMar w:top="${topM}" w:right="${rightM}" w:bottom="${botM}" w:left="${leftM}" w:header="720" w:footer="720" w:gutter="0"/>
     </w:sectPr>
   </w:body>
 </w:document>`;
@@ -917,6 +1342,7 @@ export function generateRealDocxBlob(
     { name: "word/_rels/document.xml.rels", data: encoder.encode(wordRelsXml) },
     { name: "word/styles.xml", data: encoder.encode(stylesXml) },
     { name: "word/document.xml", data: encoder.encode(documentXml) },
+    ...imageEntries,
   ];
 
   const zipBytes = buildZip(entries);

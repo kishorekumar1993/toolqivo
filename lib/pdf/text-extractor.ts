@@ -1,13 +1,14 @@
 /**
- * Toolqivo Spatial PDF Layout & Text Extraction Engine
+ * Toolqivo Spatial PDF Layout, Image & Text Extraction Engine
  * 100% Client-Side with zero server upload.
  * 
  * Extracts spatial coordinates, font metrics, line clustering,
- * heading detection, table structures, and converts them into structured Document Models.
+ * heading detection, table structures, and embedded images (JPEG/PNG),
+ * converting them into rich Microsoft Word Document Models.
  */
 
 import { getPdfJs } from "./loader";
-import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxBlock } from "../document/docx";
+import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxImageBlock, DocxBlock, DocxSection } from "../document/docx";
 
 export interface PdfTextItem {
   str: string;
@@ -79,6 +80,51 @@ function decodePdfHexString(hex: string): string {
   }
 
   return new TextDecoder("latin1").decode(bytes);
+}
+
+/**
+ * Extract native JPEG and PNG images from raw PDF byte stream
+ */
+function extractImagesFromPdfBytes(buffer: ArrayBuffer): DocxImageBlock[] {
+  const images: DocxImageBlock[] = [];
+  const bytes = new Uint8Array(buffer);
+
+  // Scan for JPEG SOI (0xFF 0xD8) to EOI (0xFF 0xD9)
+  let pos = 0;
+  while (pos < bytes.length - 10) {
+    if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8) {
+      const start = pos;
+      pos += 2;
+      let foundEnd = false;
+      while (pos < bytes.length - 1) {
+        if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd9) {
+          const end = pos + 2;
+          const imgLen = end - start;
+          // Filter out tiny thumbnails (< 1KB) or gigantic corrupted ranges (> 20MB)
+          if (imgLen > 1024 && imgLen < 20 * 1024 * 1024) {
+            const imgData = bytes.slice(start, end);
+            images.push({
+              type: "image",
+              data: imgData,
+              mimeType: "image/jpeg",
+              width: 380,
+              height: 240,
+              altText: `Extracted Image ${images.length + 1}`,
+            });
+          }
+          foundEnd = true;
+          pos = end;
+          break;
+        }
+        pos++;
+      }
+      if (!foundEnd) pos++;
+    } else {
+      pos++;
+    }
+  }
+
+  return images;
 }
 
 /**
@@ -250,10 +296,9 @@ function clusterTextItemsIntoLines(items: any[]): PdfSpatialLine[] {
     })
     .filter((it) => it.str.trim().length > 0);
 
-  // Sort items top-to-bottom (Y descending), left-to-right (X ascending)
   rawItems.sort((a, b) => {
     const dy = b.y - a.y;
-    if (Math.abs(dy) > Math.max(3.5, Math.min(a.fontSize, b.fontSize) * 0.35)) {
+    if (Math.abs(dy) > 2.5) {
       return dy;
     }
     return a.x - b.x;
@@ -268,11 +313,16 @@ function clusterTextItemsIntoLines(items: any[]): PdfSpatialLine[] {
       currentY = item.y;
       currentGroup = [item];
     } else {
-      const threshold = Math.max(3.5, item.fontSize * 0.35);
-      if (Math.abs(item.y - currentY) <= threshold) {
+      const avgGroupFontSize = currentGroup.reduce((a, b) => a + b.fontSize, 0) / currentGroup.length;
+      const fontSizeDiff = Math.abs(item.fontSize - avgGroupFontSize);
+      const yDiff = Math.abs(item.y - currentY);
+
+      // Separate lines if Y differs by > 2.5pt or if font size differs significantly with spacing
+      const isSameLine = yDiff <= 2.5 && (fontSizeDiff <= 3 || yDiff <= 1.0);
+
+      if (isSameLine) {
         currentGroup.push(item);
       } else {
-        // Finalize line
         currentGroup.sort((a, b) => a.x - b.x);
         lines.push(buildSpatialLine(currentGroup, currentY));
         currentY = item.y;
@@ -298,7 +348,7 @@ function buildSpatialLine(items: PdfTextItem[], y: number): PdfSpatialLine {
     if (lastX >= 0) {
       const gap = item.x - (lastX + lastWidth);
       if (gap > 2.0) {
-        lineText += " ";
+        lineText += gap > 20 ? "   " : " ";
       }
     }
     lineText += item.str;
@@ -311,8 +361,15 @@ function buildSpatialLine(items: PdfTextItem[], y: number): PdfSpatialLine {
   const isItalic = items.some((it) => it.isItalic);
 
   const cleanText = lineText.trim();
-  const isHeading = avgFontSize >= 14 || (isBold && avgFontSize >= 12);
-  const headingLevel = avgFontSize >= 18 ? 1 : avgFontSize >= 14 ? 2 : 3;
+  const isUppercaseSectionHeading =
+    /^[A-Z0-9\s&/,\-–—|]{4,60}$/.test(cleanText) &&
+    (isBold || avgFontSize >= 11) &&
+    !cleanText.includes("@") &&
+    !cleanText.includes(".com") &&
+    !cleanText.includes("+");
+
+  const isHeading = avgFontSize >= 14 || (isBold && avgFontSize >= 11.5) || isUppercaseSectionHeading;
+  const headingLevel = avgFontSize >= 18 ? 1 : (avgFontSize >= 14 || isUppercaseSectionHeading) ? 2 : 3;
   const isListItem = /^[•*–-]\s+|^\d+\.\s+|^\[[ x]\]\s+/i.test(cleanText);
 
   return {
@@ -329,18 +386,15 @@ function buildSpatialLine(items: PdfTextItem[], y: number): PdfSpatialLine {
 }
 
 /**
- * Build a high-fidelity DocumentModel from spatial lines and detected tables
+ * Build page blocks from spatial lines and detected tables with spacing preservation
  */
-function buildDocumentModelFromLines(lines: PdfSpatialLine[], pageWidth = 595.28, pageHeight = 841.89): DocumentModel {
+function buildBlocksFromLines(lines: PdfSpatialLine[]): DocxBlock[] {
   const blocks: DocxBlock[] = [];
-
   let tableLines: PdfSpatialLine[] = [];
 
   const flushTable = () => {
     if (tableLines.length >= 2) {
-      // Convert multi-column lines into a table
       const rows = tableLines.map((tl, rIdx) => {
-        // Split line by large gaps (> 25pt)
         const cellItems: string[] = [];
         let currentCell = "";
         let prevX = -1;
@@ -391,7 +445,6 @@ function buildDocumentModelFromLines(lines: PdfSpatialLine[], pageWidth = 595.28
   };
 
   for (const line of lines) {
-    // Check if line has multiple spaced column clusters (> 2 columns)
     let columnGaps = 0;
     for (let i = 1; i < line.items.length; i++) {
       if (line.items[i].x - (line.items[i - 1].x + line.items[i - 1].width) > 25) {
@@ -408,40 +461,184 @@ function buildDocumentModelFromLines(lines: PdfSpatialLine[], pageWidth = 595.28
 
     flushTable();
 
-    blocks.push({
-      type: "paragraph",
-      runs: line.items.map((it) => ({
-        text: it.str,
+    // Preserve whitespace between adjacent text items to prevent running words together
+    const runs: DocxTextRun[] = [];
+    let prevX = -1;
+    let prevW = 0;
+
+    for (let i = 0; i < line.items.length; i++) {
+      const it = line.items[i];
+      let prefix = "";
+      if (prevX >= 0) {
+        const gap = it.x - (prevX + prevW);
+        if (gap > 2.0) {
+          const prevRun = runs[runs.length - 1];
+          if (prevRun && !prevRun.text.endsWith(" ") && !it.str.startsWith(" ")) {
+            prefix = gap > 20 ? "   " : " ";
+          }
+        }
+      }
+
+      runs.push({
+        text: prefix + it.str,
         bold: it.isBold,
         italic: it.isItalic,
         fontSize: it.fontSize,
-      })),
+      });
+
+      prevX = it.x;
+      prevW = it.width;
+    }
+
+    blocks.push({
+      type: "paragraph",
+      runs: runs.length > 0 ? runs : [{ text: line.text }],
       isHeading: line.isHeading,
       headingLevel: line.headingLevel,
       isListItem: line.isListItem,
-      spacingBefore: line.isHeading ? 10 : 2,
+      spacingBefore: line.isHeading ? (line.headingLevel === 1 ? 14 : 10) : 2,
       spacingAfter: line.isHeading ? 6 : 4,
     });
   }
 
   flushTable();
-
-  return {
-    sections: [
-      {
-        pageSize: { width: pageWidth, height: pageHeight },
-        margins: { top: 54, right: 54, bottom: 54, left: 54 },
-        blocks,
-      },
-    ],
-  };
+  return blocks;
 }
 
 /**
- * Universal PDF Text & Spatial Layout Extractor
+ * Extract all images directly from PDF.js page operator list and object repository
+ */
+async function extractImagesFromPdfJsPage(
+  page: any,
+  viewport: any
+): Promise<{ image: DocxImageBlock; x: number; y: number }[]> {
+  const results: { image: DocxImageBlock; x: number; y: number }[] = [];
+
+  try {
+    const opList = await page.getOperatorList();
+    if (!opList || !opList.fnArray) return results;
+
+    const fnArray = opList.fnArray;
+    const argsArray = opList.argsArray;
+    let currentTransform = [1, 0, 0, 1, 0, 0];
+    const transformStack: number[][] = [];
+
+    for (let i = 0; i < fnArray.length; i++) {
+      const fn = fnArray[i];
+      const args = argsArray[i];
+
+      if (fn === 11) {
+        // OPS.save
+        transformStack.push([...currentTransform]);
+      } else if (fn === 12) {
+        // OPS.restore
+        if (transformStack.length > 0) {
+          currentTransform = transformStack.pop()!;
+        }
+      } else if (fn === 13 && args && args.length >= 6) {
+        // OPS.transform
+        currentTransform = args;
+      } else if (fn === 85 || fn === 86 || fn === 82 || fn === 83) {
+        // paintImageXObject, paintInlineImageXObject, paintImageMaskXObject
+        const imgObjName = args && args[0] ? args[0] : null;
+        if (imgObjName && page.objs) {
+          try {
+            const imgData = await new Promise<any>((resolve) => {
+              try {
+                page.objs.get(imgObjName, (obj: any) => resolve(obj));
+                setTimeout(() => resolve(null), 300);
+              } catch {
+                resolve(null);
+              }
+            });
+
+            if (
+              imgData &&
+              imgData.width >= 16 &&
+              imgData.height >= 16 &&
+              imgData.data &&
+              typeof document !== "undefined"
+            ) {
+              const canvas = document.createElement("canvas");
+              canvas.width = imgData.width;
+              canvas.height = imgData.height;
+              const ctx = canvas.getContext("2d");
+              if (ctx) {
+                const rawBuf = imgData.data;
+                const totalPixels = imgData.width * imgData.height;
+                let imgDataObj: ImageData | null = null;
+
+                if (rawBuf.length === totalPixels * 4) {
+                  imgDataObj = new ImageData(new Uint8ClampedArray(rawBuf), imgData.width, imgData.height);
+                } else if (rawBuf.length === totalPixels * 3) {
+                  const rgba = new Uint8ClampedArray(totalPixels * 4);
+                  for (let p = 0, q = 0; p < rawBuf.length; p += 3, q += 4) {
+                    rgba[q] = rawBuf[p];
+                    rgba[q + 1] = rawBuf[p + 1];
+                    rgba[q + 2] = rawBuf[p + 2];
+                    rgba[q + 3] = 255;
+                  }
+                  imgDataObj = new ImageData(rgba, imgData.width, imgData.height);
+                } else if (rawBuf.length === totalPixels) {
+                  const rgba = new Uint8ClampedArray(totalPixels * 4);
+                  for (let p = 0, q = 0; p < rawBuf.length; p++, q += 4) {
+                    const v = rawBuf[p];
+                    rgba[q] = v;
+                    rgba[q + 1] = v;
+                    rgba[q + 2] = v;
+                    rgba[q + 3] = 255;
+                  }
+                  imgDataObj = new ImageData(rgba, imgData.width, imgData.height);
+                }
+
+                if (imgDataObj) {
+                  ctx.putImageData(imgDataObj, 0, 0);
+                  const dataUrl = canvas.toDataURL("image/png");
+                  const base64 = dataUrl.split(",")[1];
+                  const binStr = atob(base64);
+                  const pngBytes = new Uint8Array(binStr.length);
+                  for (let b = 0; b < binStr.length; b++) pngBytes[b] = binStr.charCodeAt(b);
+
+                  const ptX = currentTransform[4] || 54;
+                  const ptY = (viewport.height || 841.89) - (currentTransform[5] || 750);
+                  const ptW = Math.round(Math.abs(currentTransform[0])) || Math.min(imgData.width, 180);
+                  const ptH = Math.round(Math.abs(currentTransform[3])) || Math.min(imgData.height, 180);
+
+                  results.push({
+                    image: {
+                      type: "image",
+                      data: pngBytes,
+                      mimeType: "image/png",
+                      width: ptW > 0 ? ptW : 120,
+                      height: ptH > 0 ? ptH : 120,
+                      altText: "Extracted Photo / Logo",
+                    },
+                    x: ptX,
+                    y: ptY,
+                  });
+                }
+              }
+            }
+          } catch (objErr) {
+            console.warn("Error resolving PDF.js image object:", objErr);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("extractImagesFromPdfJsPage warning:", err);
+  }
+
+  return results;
+}
+
+/**
+ * Universal PDF Text, Image & Spatial Layout Extractor
  */
 export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<ExtractedPdfContent> {
-  // 1. PDF.js Engine with spatial line clustering
+  const extractedImages = extractImagesFromPdfBytes(buffer);
+
+  // 1. PDF.js Engine with spatial line clustering & image preservation
   try {
     const pdfjs = await getPdfJs();
     if (pdfjs) {
@@ -449,15 +646,85 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
       const loadingTask = pdfjs.getDocument({ data: cloned });
       const pdfDoc = await loadingTask.promise;
       const numPages = pdfDoc.numPages;
-      const allLines: PdfSpatialLine[] = [];
+      const pageSections: DocxSection[] = [];
       const pageFormattedTexts: string[] = [];
+
+      let imgOffset = 0;
+      const imagesPerPage = Math.max(1, Math.ceil(extractedImages.length / numPages));
 
       for (let p = 1; p <= numPages; p++) {
         const page = await pdfDoc.getPage(p);
+        const viewport = page.getViewport({ scale: 1.0 });
         const textContent = await page.getTextContent();
         const pageLines = clusterTextItemsIntoLines(textContent.items);
+        const pageBlocks = buildBlocksFromLines(pageLines);
 
-        allLines.push(...pageLines);
+        // Extract native high-res images from PDF.js page
+        const pageImgResults = await extractImagesFromPdfJsPage(page, viewport);
+
+        let finalPageBlocks: DocxBlock[] = [];
+
+        if (pageImgResults.length > 0) {
+          pageImgResults.sort((a, b) => a.y - b.y);
+          // Images located in header / top region (y < 250 or at beginning)
+          const headerImgs = pageImgResults.filter((r) => r.y < 250);
+          const bodyImgs = pageImgResults.filter((r) => r.y >= 250);
+
+          if (headerImgs.length > 0) {
+            finalPageBlocks.push(...headerImgs.map((r) => r.image));
+          }
+          finalPageBlocks.push(...pageBlocks);
+          if (bodyImgs.length > 0) {
+            finalPageBlocks.push(...bodyImgs.map((r) => r.image));
+          }
+        } else {
+          // Fallback to byte stream scanned images
+          const pageImgsFallback = extractedImages.slice(imgOffset, imgOffset + imagesPerPage);
+          imgOffset += imagesPerPage;
+
+          if (pageImgsFallback.length > 0) {
+            finalPageBlocks = p === 1 ? [...pageImgsFallback, ...pageBlocks] : [...pageBlocks, ...pageImgsFallback];
+          } else {
+            finalPageBlocks = pageBlocks;
+          }
+        }
+
+        // If page has virtually no text (scanned / visual flyer), take high-res canvas snapshot
+        if (finalPageBlocks.length === 0 && typeof document !== "undefined") {
+          try {
+            const canvas = document.createElement("canvas");
+            const scale = 1.5;
+            const scaledViewport = page.getViewport({ scale });
+            canvas.width = scaledViewport.width;
+            canvas.height = scaledViewport.height;
+            const ctx = canvas.getContext("2d");
+            if (ctx) {
+              await page.render({ canvasContext: ctx, viewport: scaledViewport }).promise;
+              const dataUrl = canvas.toDataURL("image/png");
+              const base64 = dataUrl.split(",")[1];
+              const binStr = atob(base64);
+              const pngBytes = new Uint8Array(binStr.length);
+              for (let i = 0; i < binStr.length; i++) pngBytes[i] = binStr.charCodeAt(i);
+
+              finalPageBlocks.push({
+                type: "image",
+                data: pngBytes,
+                mimeType: "image/png",
+                width: viewport.width > 450 ? 450 : viewport.width,
+                height: (viewport.height / viewport.width) * (viewport.width > 450 ? 450 : viewport.width),
+                altText: `Page ${p} Visual Layout`,
+              });
+            }
+          } catch (cErr) {
+            console.warn("Canvas page snapshot warning:", cErr);
+          }
+        }
+
+        pageSections.push({
+          pageSize: { width: viewport.width || 595.28, height: viewport.height || 841.89 },
+          margins: { top: 54, right: 54, bottom: 54, left: 54 },
+          blocks: finalPageBlocks,
+        });
 
         const pageStr = pageLines
           .map((l) => {
@@ -470,15 +737,16 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
         if (pageStr.trim()) pageFormattedTexts.push(pageStr.trim());
       }
 
-      if (pageFormattedTexts.length > 0) {
-        const model = buildDocumentModelFromLines(allLines);
-        return {
-          text: pageFormattedTexts.join("\n\n"),
-          pageCount: numPages,
-          method: "pdfjs",
-          model,
-        };
-      }
+      const model: DocumentModel = {
+        sections: pageSections,
+      };
+
+      return {
+        text: pageFormattedTexts.join("\n\n"),
+        pageCount: numPages,
+        method: "pdfjs",
+        model,
+      };
     }
   } catch (pdfjsErr) {
     console.warn("PDF.js primary extraction failed, using native stream decoder:", pdfjsErr);
@@ -488,10 +756,30 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
   try {
     const streamResult = await extractTextViaStreams(buffer);
     if (streamResult.text && streamResult.text.trim().length > 0) {
+      const lines = streamResult.text.split(/\r?\n/).filter(Boolean);
+      const blocks: DocxBlock[] = lines.map((l) => ({
+        type: "paragraph" as const,
+        runs: [{ text: l }],
+      }));
+      if (extractedImages.length > 0) {
+        blocks.push(...extractedImages);
+      }
+
+      const model: DocumentModel = {
+        sections: [
+          {
+            pageSize: { width: 595.28, height: 841.89 },
+            margins: { top: 54, right: 54, bottom: 54, left: 54 },
+            blocks,
+          },
+        ],
+      };
+
       return {
         text: streamResult.text,
         pageCount: streamResult.pageCount,
         method: "content-stream",
+        model,
       };
     }
   } catch (streamErr) {

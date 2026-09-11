@@ -1,12 +1,14 @@
 /**
  * Toolqivo PDF Typography and Document Layout Engine
  * Converts Document Models, Word DOCX structure, and rich tabular data into clean, multi-page PDFs
+ * Supports inline multi-run rich text, font families, text justification, underlines,
+ * multi-section orientations, proportional table grids, and embedded images.
  * 100% Client-Side with zero server upload.
  */
 
 import { getPdfLib } from "./loader";
 import { PdfEngineError } from "./errors";
-import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxBlock } from "../document/docx";
+import { DocumentModel, DocxParagraphBlock, DocxTableBlock, DocxImageBlock, DocxBlock, DocxSection, DocxTextRun } from "../document/docx";
 
 /**
  * Transliterate and sanitize Unicode strings, emojis, and symbols into safe printable characters
@@ -81,7 +83,7 @@ export function safeDrawText(page: any, text: string, options: any): void {
 /**
  * Parse a hex color string ("#0F172A" or "0F172A") into pdf-lib RGB color
  */
-function parseHexColor(PDFLib: any, hex?: string, defaultColor = { r: 0.1, g: 0.15, b: 0.2 }) {
+function parseHexColor(PDFLib: any, hex?: string, defaultColor = { r: 0.12, g: 0.16, b: 0.23 }) {
   if (!hex) return PDFLib.rgb(defaultColor.r, defaultColor.g, defaultColor.b);
   const clean = hex.replace("#", "").trim();
   if (clean.length === 6) {
@@ -94,26 +96,165 @@ function parseHexColor(PDFLib: any, hex?: string, defaultColor = { r: 0.1, g: 0.
 }
 
 /**
- * Wrap text into lines based on available maxWidth
+ * Parse a highlight color string or named color into pdf-lib RGB color
  */
-function wrapWords(font: any, text: string, fontSize: number, maxWidth: number): string[] {
-  const lines: string[] = [];
-  const words = text.split(/\s+/);
-  let currentLine = "";
+function parseHighlightColor(PDFLib: any, hl?: string) {
+  if (!hl) return PDFLib.rgb(1, 0.96, 0.4);
+  const clean = hl.toLowerCase().trim();
+  if (clean === "yellow") return PDFLib.rgb(1, 0.95, 0.3);
+  if (clean === "green") return PDFLib.rgb(0.5, 1, 0.5);
+  if (clean === "cyan") return PDFLib.rgb(0.4, 0.9, 1);
+  if (clean === "magenta") return PDFLib.rgb(1, 0.5, 0.9);
+  if (clean === "blue") return PDFLib.rgb(0.5, 0.7, 1);
+  if (clean === "red") return PDFLib.rgb(1, 0.5, 0.5);
+  if (clean === "darkyellow" || clean === "orange") return PDFLib.rgb(1, 0.75, 0.3);
+  if (clean === "lightgray" || clean === "gray") return PDFLib.rgb(0.85, 0.85, 0.85);
+  if (clean.length === 6) return parseHexColor(PDFLib, clean);
+  return PDFLib.rgb(1, 0.95, 0.3);
+}
 
-  for (const word of words) {
-    if (!word) continue;
-    const testLine = currentLine ? `${currentLine} ${word}` : word;
-    const width = safeMeasureText(font, testLine, fontSize);
-    if (width <= maxWidth) {
-      currentLine = testLine;
-    } else {
-      if (currentLine) lines.push(currentLine);
-      currentLine = word;
+// Token for inline rich-text layout
+interface RichTextToken {
+  text: string;
+  font: any;
+  fontSize: number;
+  color: any;
+  underline?: boolean;
+  strike?: boolean;
+  superscript?: boolean;
+  subscript?: boolean;
+  highlight?: string;
+  isSpace: boolean;
+  width: number;
+}
+
+/**
+ * Split paragraph runs into styled word and whitespace tokens with long-word safety
+ */
+function tokenizeParagraphRuns(
+  runs: DocxTextRun[],
+  fontSet: any,
+  defaultFontSize: number,
+  isHeading = false,
+  PDFLib: any,
+  maxAvailableWidth = 480
+): RichTextToken[] {
+  const tokens: RichTextToken[] = [];
+
+  for (const run of runs) {
+    const rawText = sanitizeTextForPdf(run.text);
+    if (!rawText) continue;
+
+    // Font family selection
+    const fam = (run.fontFamily || "").toLowerCase();
+    let familyFonts = fontSet.sans;
+    if (fam.includes("times") || fam.includes("serif") || fam.includes("georgia") || fam.includes("cambria")) {
+      familyFonts = fontSet.serif;
+    } else if (fam.includes("courier") || fam.includes("mono") || fam.includes("consolas")) {
+      familyFonts = fontSet.mono;
+    }
+
+    // Font weight/style
+    let font = familyFonts.regular;
+    if (run.bold && run.italic) font = familyFonts.boldItalic;
+    else if (run.bold || isHeading) font = familyFonts.bold;
+    else if (run.italic) font = familyFonts.italic;
+
+    let fontSize = run.fontSize || defaultFontSize;
+    if (run.superscript || run.subscript) {
+      fontSize = Math.max(6, Math.round(fontSize * 0.72 * 10) / 10);
+    }
+
+    const color = parseHexColor(
+      PDFLib,
+      run.color,
+      isHeading ? { r: 0.06, g: 0.09, b: 0.16 } : { r: 0.12, g: 0.16, b: 0.23 }
+    );
+
+    // Split run into words and spaces preserving whitespace
+    const parts = rawText.split(/(\s+)/);
+    for (const part of parts) {
+      if (!part) continue;
+      const isSpace = /^\s+$/.test(part);
+      if (isSpace) {
+        const width = safeMeasureText(font, " ", fontSize);
+        tokens.push({
+          text: " ",
+          font,
+          fontSize,
+          color,
+          underline: run.underline,
+          strike: run.strike,
+          superscript: run.superscript,
+          subscript: run.subscript,
+          highlight: run.highlight,
+          isSpace: true,
+          width,
+        });
+      } else {
+        const fullW = safeMeasureText(font, part, fontSize);
+        if (fullW > maxAvailableWidth && maxAvailableWidth > 50) {
+          // Word is wider than entire content area: split into character sub-tokens
+          let currentChunk = "";
+          for (let i = 0; i < part.length; i++) {
+            const testChunk = currentChunk + part[i];
+            const testW = safeMeasureText(font, testChunk, fontSize);
+            if (testW > maxAvailableWidth && currentChunk.length > 0) {
+              const chunkW = safeMeasureText(font, currentChunk, fontSize);
+              tokens.push({
+                text: currentChunk,
+                font,
+                fontSize,
+                color,
+                underline: run.underline,
+                strike: run.strike,
+                superscript: run.superscript,
+                subscript: run.subscript,
+                highlight: run.highlight,
+                isSpace: false,
+                width: chunkW,
+              });
+              currentChunk = part[i];
+            } else {
+              currentChunk = testChunk;
+            }
+          }
+          if (currentChunk.length > 0) {
+            const chunkW = safeMeasureText(font, currentChunk, fontSize);
+            tokens.push({
+              text: currentChunk,
+              font,
+              fontSize,
+              color,
+              underline: run.underline,
+              strike: run.strike,
+              superscript: run.superscript,
+              subscript: run.subscript,
+              highlight: run.highlight,
+              isSpace: false,
+              width: chunkW,
+            });
+          }
+        } else {
+          tokens.push({
+            text: part,
+            font,
+            fontSize,
+            color,
+            underline: run.underline,
+            strike: run.strike,
+            superscript: run.superscript,
+            subscript: run.subscript,
+            highlight: run.highlight,
+            isSpace: false,
+            width: fullW,
+          });
+        }
+      }
     }
   }
-  if (currentLine) lines.push(currentLine);
-  return lines.length > 0 ? lines : [text];
+
+  return tokens;
 }
 
 /**
@@ -130,124 +271,256 @@ export async function convertDocumentModelToPdf(
     throw new PdfEngineError("PDF engine could not be loaded in browser.", "LOADER_ERROR");
   }
 
-  if (onProgress) onProgress("Embedding typography and font glyphs...", 35);
+  if (onProgress) onProgress("Embedding typography and font families...", 35);
   const pdfDoc = await PDFLib.PDFDocument.create();
 
-  const regularFont = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBold);
-  const italicFont = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaOblique);
-  const boldItalicFont = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBoldOblique);
-
-  // Document default settings
-  const firstSection = model.sections[0] || {
-    pageSize: { width: 595.28, height: 841.89 },
-    margins: { top: 54, right: 54, bottom: 54, left: 54 },
-    blocks: [],
+  // Embed Font Families: Sans-serif (Helvetica), Serif (Times), Monospace (Courier)
+  const fontSet = {
+    sans: {
+      regular: await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica),
+      bold: await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBold),
+      italic: await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaOblique),
+      boldItalic: await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBoldOblique),
+    },
+    serif: {
+      regular: await pdfDoc.embedFont(PDFLib.StandardFonts.TimesRoman),
+      bold: await pdfDoc.embedFont(PDFLib.StandardFonts.TimesRomanBold),
+      italic: await pdfDoc.embedFont(PDFLib.StandardFonts.TimesRomanItalic),
+      boldItalic: await pdfDoc.embedFont(PDFLib.StandardFonts.TimesRomanBoldItalic),
+    },
+    mono: {
+      regular: await pdfDoc.embedFont(PDFLib.StandardFonts.Courier),
+      bold: await pdfDoc.embedFont(PDFLib.StandardFonts.CourierBold),
+      italic: await pdfDoc.embedFont(PDFLib.StandardFonts.CourierOblique),
+      boldItalic: await pdfDoc.embedFont(PDFLib.StandardFonts.CourierBoldOblique),
+    },
   };
 
-  const pageWidth = firstSection.pageSize?.width || 595.28;
-  const pageHeight = firstSection.pageSize?.height || 841.89;
-  const marginTop = Math.max(36, firstSection.margins?.top || 54);
-  const marginRight = Math.max(36, firstSection.margins?.right || 54);
-  const marginBottom = Math.max(36, firstSection.margins?.bottom || 54);
-  const marginLeft = Math.max(36, firstSection.margins?.left || 54);
-  const contentWidth = pageWidth - marginLeft - marginRight;
+  const pages: { page: any; width: number; height: number; marginBottom: number }[] = [];
+  let currentPage: any = null;
+  let currentY = 0;
+  let currentSecPageWidth = 595.28;
+  let currentSecPageHeight = 841.89;
+  let currentMarginTop = 54;
+  let currentMarginRight = 54;
+  let currentMarginBottom = 54;
+  let currentMarginLeft = 54;
+  let currentContentWidth = 487.28;
 
-  const pages: any[] = [];
-  let currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-  pages.push(currentPage);
-  let currentY = pageHeight - marginTop;
+  const addNewPage = (w = currentSecPageWidth, h = currentSecPageHeight) => {
+    currentPage = pdfDoc.addPage([w, h]);
+    pages.push({
+      page: currentPage,
+      width: w,
+      height: h,
+      marginBottom: currentMarginBottom,
+    });
+    currentY = h - currentMarginTop;
+    return currentPage;
+  };
 
   const checkPageBreak = (neededHeight: number) => {
-    if (currentY - neededHeight < marginBottom) {
-      currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-      pages.push(currentPage);
-      currentY = pageHeight - marginTop;
+    if (currentY - neededHeight < currentMarginBottom) {
+      addNewPage();
     }
   };
 
-  if (onProgress) onProgress("Rendering document sections and typography...", 60);
+  if (onProgress) onProgress("Rendering document sections and rich-text layout...", 60);
 
-  // Document Title Header (if not empty and not matching first heading)
-  const safeDocTitle = sanitizeTextForPdf(docTitle);
-  if (safeDocTitle && safeDocTitle !== "Document") {
-    safeDrawText(currentPage, safeDocTitle, {
-      x: marginLeft,
-      y: currentY - 18,
-      size: 18,
-      font: boldFont,
-      color: PDFLib.rgb(0.06, 0.09, 0.16),
-    });
-    currentY -= 32;
-  }
+  // Iterate sections
+  for (let sIdx = 0; sIdx < model.sections.length; sIdx++) {
+    const section = model.sections[sIdx];
+    currentSecPageWidth = section.pageSize?.width || 595.28;
+    currentSecPageHeight = section.pageSize?.height || 841.89;
+    currentMarginTop = Math.max(30, section.margins?.top || 54);
+    currentMarginRight = Math.max(30, section.margins?.right || 54);
+    currentMarginBottom = Math.max(30, section.margins?.bottom || 54);
+    currentMarginLeft = Math.max(30, section.margins?.left || 54);
+    currentContentWidth = currentSecPageWidth - currentMarginLeft - currentMarginRight;
 
-  // Iterate sections and blocks
-  for (const section of model.sections) {
+    // Start section on a new page (or initial page)
+    if (!currentPage || sIdx > 0) {
+      addNewPage(currentSecPageWidth, currentSecPageHeight);
+    }
+
+    // Render Blocks in Section
     for (const block of section.blocks) {
       if (block.type === "paragraph") {
         const para = block as DocxParagraphBlock;
+        if (para.pageBreakBefore) {
+          addNewPage();
+        }
+
         const isHeading = para.isHeading;
         const level = para.headingLevel || 1;
         const isListItem = para.isListItem;
-
-        const fontSize = isHeading ? (level === 1 ? 16 : level === 2 ? 13 : 11.5) : 10;
-        const lineHeight = fontSize * 1.35;
-        const beforeSpace = para.spacingBefore || (isHeading ? 10 : 2);
-        const afterSpace = para.spacingAfter || (isHeading ? 6 : 4);
+        const defaultFontSize = isHeading ? (level === 1 ? 16 : level === 2 ? 13 : 11.5) : 10;
+        const beforeSpace = para.spacingBefore !== undefined ? para.spacingBefore : (isHeading ? 10 : 2);
+        const afterSpace = para.spacingAfter !== undefined ? para.spacingAfter : (isHeading ? 6 : 4);
 
         currentY -= beforeSpace;
-        checkPageBreak(lineHeight + afterSpace);
 
-        const indent = isListItem ? 16 : 0;
-        const maxTextWidth = contentWidth - indent;
+        const baseLeftIndent = (para.leftIndent || 0) + (isListItem ? 16 : 0);
+        const rightIndent = para.rightIndent || 0;
+        const firstLineIndent = para.firstLineIndent || 0;
+        const hangingIndent = para.hangingIndent || 0;
+        const maxTextWidth = Math.max(60, currentContentWidth - baseLeftIndent - rightIndent);
 
-        // Draw bullet point icon if list item
+        // Draw bullet point marker if list item
         if (isListItem) {
           safeDrawText(currentPage, "*", {
-            x: marginLeft + 4,
-            y: currentY - fontSize,
-            size: fontSize,
-            font: boldFont,
+            x: currentMarginLeft + (para.leftIndent || 0) + 4,
+            y: currentY - defaultFontSize,
+            size: defaultFontSize,
+            font: fontSet.sans.bold,
             color: PDFLib.rgb(0.05, 0.58, 0.53),
           });
         }
 
-        // Aggregate runs into formatted lines
-        for (const run of para.runs) {
-          const runText = sanitizeTextForPdf(run.text);
-          if (!runText) continue;
+        // Tokenize paragraph runs into inline words and spaces (with long-word protection)
+        const tokens = tokenizeParagraphRuns(para.runs, fontSet, defaultFontSize, isHeading, PDFLib, maxTextWidth);
+        if (tokens.length === 0) {
+          currentY -= afterSpace;
+          continue;
+        }
 
-          let runFont = regularFont;
-          if (run.bold && run.italic) runFont = boldItalicFont;
-          else if (run.bold || isHeading) runFont = boldFont;
-          else if (run.italic) runFont = italicFont;
+        // Line Wrapping & Layout Engine (Combines multi-runs seamlessly across lines)
+        const lines: { tokens: RichTextToken[]; lineWidth: number; maxFontSize: number }[] = [];
+        let curLineTokens: RichTextToken[] = [];
+        let curLineWidth = 0;
+        let curLineMaxFontSize = defaultFontSize;
 
-          const runFontSize = run.fontSize || fontSize;
-          const runColor = parseHexColor(PDFLib, run.color, isHeading ? { r: 0.06, g: 0.09, b: 0.16 } : { r: 0.12, g: 0.16, b: 0.23 });
+        for (const token of tokens) {
+          if (curLineTokens.length === 0 && token.isSpace) {
+            continue; // Skip leading whitespace
+          }
 
-          const wrappedLines = wrapWords(runFont, runText, runFontSize, maxTextWidth);
+          const isFirstLine = lines.length === 0;
+          const currentLineIndent = isFirstLine ? firstLineIndent : hangingIndent;
+          const targetLineWidth = Math.max(50, maxTextWidth - currentLineIndent);
 
-          for (const line of wrappedLines) {
-            checkPageBreak(lineHeight);
-            let drawX = marginLeft + indent;
-            if (para.alignment === "center") {
-              const textW = safeMeasureText(runFont, line, runFontSize);
-              drawX = marginLeft + (contentWidth - textW) / 2;
-            } else if (para.alignment === "right") {
-              const textW = safeMeasureText(runFont, line, runFontSize);
-              drawX = marginLeft + contentWidth - textW;
+          if (curLineWidth + token.width <= targetLineWidth || curLineTokens.length === 0) {
+            curLineTokens.push(token);
+            curLineWidth += token.width;
+            if (token.fontSize > curLineMaxFontSize) curLineMaxFontSize = token.fontSize;
+          } else {
+            // Trim trailing space from line
+            while (curLineTokens.length > 0 && curLineTokens[curLineTokens.length - 1].isSpace) {
+              const removed = curLineTokens.pop()!;
+              curLineWidth -= removed.width;
             }
 
-            safeDrawText(currentPage, line, {
-              x: drawX,
-              y: currentY - runFontSize,
-              size: runFontSize,
-              font: runFont,
-              color: runColor,
-            });
+            lines.push({ tokens: curLineTokens, lineWidth: curLineWidth, maxFontSize: curLineMaxFontSize });
 
-            currentY -= lineHeight;
+            if (token.isSpace) {
+              curLineTokens = [];
+              curLineWidth = 0;
+              curLineMaxFontSize = defaultFontSize;
+            } else {
+              curLineTokens = [token];
+              curLineWidth = token.width;
+              curLineMaxFontSize = token.fontSize;
+            }
           }
+        }
+
+        if (curLineTokens.length > 0) {
+          while (curLineTokens.length > 0 && curLineTokens[curLineTokens.length - 1].isSpace) {
+            const removed = curLineTokens.pop()!;
+            curLineWidth -= removed.width;
+          }
+          if (curLineTokens.length > 0) {
+            lines.push({ tokens: curLineTokens, lineWidth: curLineWidth, maxFontSize: curLineMaxFontSize });
+          }
+        }
+
+        // Draw Lines
+        for (let lIdx = 0; lIdx < lines.length; lIdx++) {
+          const line = lines[lIdx];
+          const isLastLine = lIdx === lines.length - 1;
+          const isFirstLine = lIdx === 0;
+          const lineHeight = para.lineSpacing && para.lineSpacing > 0 ? para.lineSpacing : line.maxFontSize * 1.35;
+
+          checkPageBreak(lineHeight);
+
+          const lineIndentOffset = isFirstLine ? firstLineIndent : hangingIndent;
+          const lineAvailableW = Math.max(50, maxTextWidth - lineIndentOffset);
+          const startBaseX = currentMarginLeft + baseLeftIndent + lineIndentOffset;
+
+          let startX = startBaseX;
+          let spaceExtra = 0;
+
+          if (para.alignment === "center") {
+            startX = startBaseX + (lineAvailableW - line.lineWidth) / 2;
+          } else if (para.alignment === "right") {
+            startX = startBaseX + (lineAvailableW - line.lineWidth);
+          } else if (para.alignment === "justify" && !isLastLine) {
+            const spaceCount = line.tokens.filter((t) => t.isSpace).length;
+            if (spaceCount > 0 && lineAvailableW > line.lineWidth) {
+              spaceExtra = (lineAvailableW - line.lineWidth) / spaceCount;
+            }
+          }
+
+          // Draw tokens sequentially
+          let curX = startX;
+          for (const token of line.tokens) {
+            const tokenW = token.isSpace ? token.width + spaceExtra : token.width;
+
+            if (!token.isSpace) {
+              // Highlight background
+              if (token.highlight) {
+                const hlColor = parseHighlightColor(PDFLib, token.highlight);
+                currentPage.drawRectangle({
+                  x: curX - 0.5,
+                  y: currentY - token.fontSize * 1.05,
+                  width: tokenW + 1,
+                  height: token.fontSize * 1.25,
+                  color: hlColor,
+                });
+              }
+
+              let drawY = currentY - token.fontSize;
+              if (token.superscript) {
+                drawY += token.fontSize * 0.4;
+              } else if (token.subscript) {
+                drawY -= token.fontSize * 0.15;
+              }
+
+              safeDrawText(currentPage, token.text, {
+                x: curX,
+                y: drawY,
+                size: token.fontSize,
+                font: token.font,
+                color: token.color,
+              });
+
+              // Underline drawing
+              if (token.underline) {
+                const uY = currentY - token.fontSize - 1.5;
+                currentPage.drawLine({
+                  start: { x: curX, y: uY },
+                  end: { x: curX + tokenW, y: uY },
+                  thickness: Math.max(0.6, token.fontSize * 0.055),
+                  color: token.color,
+                });
+              }
+
+              // Strikethrough drawing
+              if (token.strike) {
+                const sY = currentY - token.fontSize * 0.52;
+                currentPage.drawLine({
+                  start: { x: curX, y: sY },
+                  end: { x: curX + tokenW, y: sY },
+                  thickness: Math.max(0.6, token.fontSize * 0.055),
+                  color: token.color,
+                });
+              }
+            }
+
+            curX += tokenW;
+          }
+
+          currentY -= lineHeight;
         }
 
         currentY -= afterSpace;
@@ -255,84 +528,157 @@ export async function convertDocumentModelToPdf(
         const tbl = block as DocxTableBlock;
         if (tbl.rows.length === 0) continue;
 
-        currentY -= 8;
-        const numCols = Math.max(...tbl.rows.map((r) => r.cells.length));
-        if (numCols === 0) continue;
+        currentY -= 6;
+        const totalCols = Math.max(...tbl.rows.map((r) => r.cells.reduce((acc, c) => acc + (c.colSpan || 1), 0)));
+        if (totalCols === 0) continue;
 
-        const colWidth = contentWidth / numCols;
+        // Calculate proportional column widths
+        let colWidths: number[] = [];
+        if (tbl.colWidths && tbl.colWidths.length === totalCols) {
+          const sumW = tbl.colWidths.reduce((a, b) => a + b, 0);
+          colWidths = tbl.colWidths.map((w) => (w / sumW) * currentContentWidth);
+        } else {
+          colWidths = Array(totalCols).fill(currentContentWidth / totalCols);
+        }
+
         const cellPadding = 5;
 
         for (let rIdx = 0; rIdx < tbl.rows.length; rIdx++) {
           const row = tbl.rows[rIdx];
           const isHeader = row.isHeader || rIdx === 0;
 
-          // Compute row height based on cell text wraps
-          let maxCellLines = 1;
-          const cellLinesList: string[][] = [];
+          // Compute cell bounding heights based on tokens
+          let maxRowHeight = 22;
+          const cellTokenLines: { cell: any; lines: any[]; width: number; colStart: number }[] = [];
 
-          for (let cIdx = 0; cIdx < numCols; cIdx++) {
-            const cell = row.cells[cIdx];
-            const cellText = cell
-              ? cell.blocks
-                  .map((p) => p.runs.map((r) => r.text).join(""))
-                  .join(" ")
-              : "";
-            const safeCell = sanitizeTextForPdf(cellText);
-            const wrapped = wrapWords(isHeader ? boldFont : regularFont, safeCell, 9, colWidth - cellPadding * 2);
-            cellLinesList.push(wrapped);
-            if (wrapped.length > maxCellLines) maxCellLines = wrapped.length;
-          }
-
-          const rowHeight = maxCellLines * 12 + cellPadding * 2;
-          checkPageBreak(rowHeight);
-
-          // Draw row background
-          const rowBg = isHeader
-            ? PDFLib.rgb(0.94, 0.96, 0.98) // slate-100
-            : rIdx % 2 === 1
-            ? PDFLib.rgb(0.98, 0.99, 1.0)
-            : PDFLib.rgb(1, 1, 1);
-
-          currentPage.drawRectangle({
-            x: marginLeft,
-            y: currentY - rowHeight,
-            width: contentWidth,
-            height: rowHeight,
-            color: rowBg,
-            borderColor: PDFLib.rgb(0.85, 0.88, 0.92),
-            borderWidth: 0.5,
-          });
-
-          // Draw cell borders & text
-          for (let cIdx = 0; cIdx < numCols; cIdx++) {
-            const cellX = marginLeft + cIdx * colWidth;
-            const lines = cellLinesList[cIdx] || [];
-
-            for (let lIdx = 0; lIdx < lines.length; lIdx++) {
-              safeDrawText(currentPage, lines[lIdx], {
-                x: cellX + cellPadding,
-                y: currentY - cellPadding - 9 - lIdx * 12,
-                size: 9,
-                font: isHeader ? boldFont : regularFont,
-                color: isHeader ? PDFLib.rgb(0.06, 0.09, 0.16) : PDFLib.rgb(0.12, 0.16, 0.23),
-              });
+          let colCursor = 0;
+          for (const cell of row.cells) {
+            const span = cell.colSpan || 1;
+            let cellWidth = 0;
+            for (let c = 0; c < span && colCursor + c < colWidths.length; c++) {
+              cellWidth += colWidths[colCursor + c];
             }
 
-            // Cell vertical right border
-            if (cIdx < numCols - 1) {
-              currentPage.drawLine({
-                start: { x: cellX + colWidth, y: currentY },
-                end: { x: cellX + colWidth, y: currentY - rowHeight },
-                thickness: 0.5,
-                color: PDFLib.rgb(0.88, 0.91, 0.95),
-              });
+            const allCellRuns: DocxTextRun[] = [];
+            for (const p of cell.blocks) {
+              allCellRuns.push(...p.runs);
             }
+
+            const cellTokens = tokenizeParagraphRuns(
+              allCellRuns,
+              fontSet,
+              isHeader ? 9 : 8.5,
+              isHeader,
+              PDFLib
+            );
+
+            // Wrap cell tokens
+            const maxCellW = cellWidth - cellPadding * 2;
+            const cLines: RichTextToken[][] = [];
+            let cCurLine: RichTextToken[] = [];
+            let cCurW = 0;
+
+            for (const token of cellTokens) {
+              if (cCurLine.length === 0 && token.isSpace) continue;
+              if (cCurW + token.width <= maxCellW || cCurLine.length === 0) {
+                cCurLine.push(token);
+                cCurW += token.width;
+              } else {
+                cLines.push(cCurLine);
+                cCurLine = token.isSpace ? [] : [token];
+                cCurW = token.isSpace ? 0 : token.width;
+              }
+            }
+            if (cCurLine.length > 0) cLines.push(cCurLine);
+
+            const cellEstimatedH = Math.max(1, cLines.length) * 11.5 + cellPadding * 2;
+            if (cellEstimatedH > maxRowHeight) maxRowHeight = cellEstimatedH;
+
+            cellTokenLines.push({ cell, lines: cLines, width: cellWidth, colStart: colCursor });
+            colCursor += span;
           }
 
-          currentY -= rowHeight;
+          checkPageBreak(maxRowHeight);
+
+          // Draw cells in row
+          let currentCellX = currentMarginLeft;
+          for (const item of cellTokenLines) {
+            const cellBg = item.cell.bgColor
+              ? parseHexColor(PDFLib, item.cell.bgColor)
+              : isHeader
+              ? PDFLib.rgb(0.94, 0.96, 0.98)
+              : rIdx % 2 === 1
+              ? PDFLib.rgb(0.98, 0.99, 1.0)
+              : PDFLib.rgb(1, 1, 1);
+
+            // Draw cell background
+            currentPage.drawRectangle({
+              x: currentCellX,
+              y: currentY - maxRowHeight,
+              width: item.width,
+              height: maxRowHeight,
+              color: cellBg,
+              borderColor: PDFLib.rgb(0.85, 0.88, 0.92),
+              borderWidth: 0.5,
+            });
+
+            // Draw cell text tokens
+            for (let lIdx = 0; lIdx < item.lines.length; lIdx++) {
+              const cLine = item.lines[lIdx];
+              let drawTokenX = currentCellX + cellPadding;
+              const drawTokenY = currentY - cellPadding - 9 - lIdx * 11.5;
+
+              for (const token of cLine) {
+                if (!token.isSpace) {
+                  safeDrawText(currentPage, token.text, {
+                    x: drawTokenX,
+                    y: drawTokenY,
+                    size: token.fontSize,
+                    font: token.font,
+                    color: token.color,
+                  });
+                }
+                drawTokenX += token.width;
+              }
+            }
+
+            currentCellX += item.width;
+          }
+
+          currentY -= maxRowHeight;
         }
 
         currentY -= 10;
+      } else if (block.type === "image") {
+        try {
+          const imgBlock = block as DocxImageBlock;
+          const isPng = imgBlock.mimeType === "image/png" || imgBlock.data[0] === 0x89;
+          const embeddedImg = isPng
+            ? await pdfDoc.embedPng(imgBlock.data)
+            : await pdfDoc.embedJpg(imgBlock.data);
+
+          let imgW = imgBlock.width || 380;
+          let imgH = imgBlock.height || 240;
+          if (imgW > currentContentWidth) {
+            const scale = currentContentWidth / imgW;
+            imgW = currentContentWidth;
+            imgH = imgH * scale;
+          }
+
+          checkPageBreak(imgH + 20);
+          const drawX = imgW < 220 ? currentMarginLeft : currentMarginLeft + (currentContentWidth - imgW) / 2;
+
+          currentPage.drawImage(embeddedImg, {
+            x: drawX,
+            y: currentY - imgH,
+            width: imgW,
+            height: imgH,
+          });
+
+          currentY -= imgH + 16;
+        } catch (imgErr) {
+          console.warn("PDF typography image embedding warning:", imgErr);
+        }
       }
     }
   }
@@ -341,14 +687,14 @@ export async function convertDocumentModelToPdf(
   if (onProgress) onProgress("Finalizing multi-page layout and numbering...", 90);
   const totalPages = pages.length;
   for (let i = 0; i < totalPages; i++) {
-    const p = pages[i];
+    const pInfo = pages[i];
     const footerText = `Page ${i + 1} of ${totalPages}`;
-    const textW = safeMeasureText(regularFont, footerText, 8.5);
-    safeDrawText(p, footerText, {
-      x: (pageWidth - textW) / 2,
-      y: marginBottom / 2,
+    const textW = safeMeasureText(fontSet.sans.regular, footerText, 8.5);
+    safeDrawText(pInfo.page, footerText, {
+      x: (pInfo.width - textW) / 2,
+      y: pInfo.marginBottom / 2,
       size: 8.5,
-      font: regularFont,
+      font: fontSet.sans.regular,
       color: PDFLib.rgb(0.5, 0.55, 0.65),
     });
   }
@@ -453,8 +799,9 @@ export async function convertTableOrSpreadsheetToPdf(
     title,
     sections: [
       {
-        pageSize: { width: 841.89, height: 595.28 }, // Landscape A4 for wide tables
+        pageSize: { width: 841.89, height: 595.28 },
         margins: { top: 40, right: 40, bottom: 40, left: 40 },
+        orientation: "landscape",
         blocks: [
           {
             type: "table",
