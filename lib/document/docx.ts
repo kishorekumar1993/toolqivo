@@ -256,7 +256,26 @@ async function decompressZipEntryBytes(
 export interface ExtractedDocxPackage {
   documentXml: string;
   relsXml: string;
+  relMaps: Map<string, Map<string, string>>;
   mediaFiles: Map<string, Uint8Array>;
+}
+
+function parseRelationshipMap(relsXml: string): Map<string, string> {
+  const relMap = new Map<string, string>();
+  if (!relsXml) return relMap;
+
+  const relMatches = relsXml.match(/<Relationship\b[\s\S]*?(?:\/\>|<\/Relationship>)/gi);
+  if (!relMatches) return relMap;
+
+  for (const r of relMatches) {
+    const idMatch = r.match(/Id="([^"]+)"/i);
+    const targetMatch = r.match(/Target="([^"]+)"/i);
+    if (idMatch && targetMatch) {
+      relMap.set(idMatch[1], targetMatch[1]);
+    }
+  }
+
+  return relMap;
 }
 
 /**
@@ -323,6 +342,7 @@ export async function extractDocxPackage(buffer: ArrayBuffer): Promise<Extracted
   const result: ExtractedDocxPackage = {
     documentXml: "",
     relsXml: "",
+    relMaps: new Map(),
     mediaFiles: new Map(),
   };
 
@@ -375,9 +395,29 @@ export async function extractDocxPackage(buffer: ArrayBuffer): Promise<Extracted
 
             if (filename === "word/document.xml" || filename.endsWith("document.xml")) {
               result.documentXml = new TextDecoder("utf-8").decode(uncomp);
-            } else if (filename.includes("_rels/")) {
+            } else if (filename.endsWith(".rels")) {
               const relText = new TextDecoder("utf-8").decode(uncomp);
-              result.relsXml = (result.relsXml ? result.relsXml + "\n" : "") + relText;
+              if (filename === "word/_rels/document.xml.rels") {
+                result.relsXml = relText;
+              }
+
+              const relPart = filename
+                .replace(/^word\//, "")
+                .replace(/^_rels\//, "")
+                .replace(/\/\_rels\//, "/")
+                .replace(/\.rels$/i, "");
+
+              if (filename.includes("/_rels/") || filename.startsWith("_rels/")) {
+                const normalizedRelPart = relPart || "document.xml";
+                result.relMaps.set(normalizedRelPart, parseRelationshipMap(relText));
+                if (!normalizedRelPart.startsWith("word/")) {
+                  result.relMaps.set(`word/${normalizedRelPart}`, result.relMaps.get(normalizedRelPart)!);
+                }
+              }
+
+              if (filename === "_rels/.rels") {
+                result.relMaps.set("/", parseRelationshipMap(relText));
+              }
             } else {
               const cleanName = filename.replace(/^word\//, "");
               result.mediaFiles.set(cleanName, uncomp);
@@ -457,6 +497,41 @@ function parseSectionProps(sectPrXml: string): {
   };
 }
 
+async function getImageDimensionsFromBytes(
+  imgBytes: Uint8Array,
+  fallbackWidth?: number,
+  fallbackHeight?: number
+): Promise<{ width: number; height: number }> {
+  let width = fallbackWidth && fallbackWidth > 0 ? fallbackWidth : 200;
+  let height = fallbackHeight && fallbackHeight > 0 ? fallbackHeight : 200;
+
+  try {
+    if (typeof Image !== "undefined") {
+      const blob = new Blob([imgBytes as BlobPart], {
+        type: /^\x89PNG/.test(String.fromCharCode(...imgBytes.slice(0, 4))) ? "image/png" : "image/jpeg",
+      });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.decoding = "async";
+      img.src = url;
+      await new Promise<void>((resolve) => {
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+        setTimeout(() => resolve(), 250);
+      });
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+        width = img.naturalWidth * 0.75;
+        height = img.naturalHeight * 0.75;
+      }
+      URL.revokeObjectURL(url);
+    }
+  } catch {
+    // keep the DOCX-derived fallback dimensions when browser image decoding is unavailable
+  }
+
+  return { width, height };
+}
+
 function parseParagraphXml(
   pXml: string,
   relMap: Map<string, string>,
@@ -501,12 +576,13 @@ function parseParagraphXml(
             }
           }
           const isPng = (target && target.toLowerCase().endsWith(".png")) || imgBytes[0] === 0x89;
+          const finalDims = { width: width > 0 ? width : 200, height: height > 0 ? height : 200 };
           blocks.push({
             type: "image",
             data: imgBytes,
             mimeType: isPng ? "image/png" : "image/jpeg",
-            width: width > 0 ? width : 200,
-            height: height > 0 ? height : 200,
+            width: finalDims.width,
+            height: finalDims.height,
             altText: "Word Embedded Image",
           });
         }
@@ -1228,9 +1304,10 @@ export function generateRealDocxBlob(
                   tcPrParts.push(`<w:tcMar><w:top w:w="120"/><w:bottom w:w="120"/><w:left w:w="140"/><w:right w:w="140"/></w:tcMar>`);
 
                   const pContent = cell.blocks
+                    .filter((p): p is DocxParagraphBlock => p.type === "paragraph")
                     .map((p) => {
                       const runs = p.runs
-                        .map((r) => {
+                        .map((r: DocxTextRun) => {
                           const rPrParts: string[] = [];
                           if (r.fontFamily) rPrParts.push(`<w:rFonts w:ascii="${escapeXml(r.fontFamily)}" w:hAnsi="${escapeXml(r.fontFamily)}"/>`);
                           if (r.bold) rPrParts.push("<w:b/>");
@@ -1244,7 +1321,7 @@ export function generateRealDocxBlob(
                           if (r.color) rPrParts.push(`<w:color w:val="${r.color.replace("#", "")}"/>`);
                           const rPr = rPrParts.length > 0 ? `<w:rPr>${rPrParts.join("")}</w:rPr>` : "";
                           const textContent = r.text.includes("\n")
-                            ? r.text.split("\n").map((part) => `<w:t xml:space="preserve">${escapeXml(part)}</w:t>`).join("<w:br/>")
+                            ? r.text.split("\n").map((part: string) => `<w:t xml:space="preserve">${escapeXml(part)}</w:t>`).join("<w:br/>")
                             : `<w:t xml:space="preserve">${escapeXml(r.text)}</w:t>`;
                           return `<w:r>${rPr}${textContent}</w:r>`;
                         })

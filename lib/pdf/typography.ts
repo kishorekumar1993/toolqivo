@@ -419,57 +419,41 @@ async function renderHeaderTable(
     console.warn("Header profile image render failed:", e);
   }
 
-  // Text starts after the photo
+  // Text starts after the photo, using the actual paragraph ordering from the header table.
   const textX = marginLeft + 120;
   let textY = currentY - 22;
 
-  // Extract text from all header cells
-  const headerText: string[] = [];
+  const headerParagraphs: Array<{ text: string; alignment?: "left" | "center" | "right" | "justify"; isPrimary?: boolean }> = [];
   for (const cell of firstRow.cells) {
+    if (cell.blocks.some((block) => block.type === "image")) continue;
     for (const block of cell.blocks || []) {
       if (block.type !== "paragraph") continue;
-      const text = ((block as DocxParagraphBlock).runs || [])
+      const paragraphText = ((block as DocxParagraphBlock).runs || [])
         .map((r: any) => r.text || "")
         .join("")
         .trim();
-      if (text) headerText.push(text);
+      if (paragraphText) {
+        headerParagraphs.push({
+          text: paragraphText,
+          alignment: (block as DocxParagraphBlock).alignment || "left",
+          isPrimary: headerParagraphs.length === 0,
+        });
+      }
     }
   }
 
-  // Name
-  if (headerText[0]) {
-    safeDrawText(currentPage, sanitizeTextForPdf(headerText[0]), {
-      x: textX,
+  for (let i = 0; i < headerParagraphs.length; i++) {
+    const paragraph = headerParagraphs[i];
+    const isName = i === 0;
+    const isDesignation = i === 1;
+    safeDrawText(currentPage, sanitizeTextForPdf(paragraph.text), {
+      x: textX + (paragraph.alignment === "right" ? 110 : 0),
       y: textY,
-      size: 18,
-      font: fonts.bold,
-      color: PDFLib.rgb(0.05, 0.25, 0.40),
+      size: isName ? 18 : isDesignation ? 11 : 8.5,
+      font: isName || isDesignation ? fonts.bold : fonts.regular,
+      color: isName ? PDFLib.rgb(0.05, 0.25, 0.40) : isDesignation ? PDFLib.rgb(0.10, 0.45, 0.70) : PDFLib.rgb(0.12, 0.16, 0.23),
     });
-    textY -= 22;
-  }
-
-  // Designation
-  if (headerText[1]) {
-    safeDrawText(currentPage, sanitizeTextForPdf(headerText[1]), {
-      x: textX,
-      y: textY,
-      size: 11,
-      font: fonts.bold,
-      color: PDFLib.rgb(0.10, 0.45, 0.70),
-    });
-    textY -= 16;
-  }
-
-  // Remaining contact information
-  for (let i = 2; i < headerText.length; i++) {
-    safeDrawText(currentPage, sanitizeTextForPdf(headerText[i]), {
-      x: textX,
-      y: textY,
-      size: 8.5,
-      font: fonts.regular,
-      color: PDFLib.rgb(0.12, 0.16, 0.23),
-    });
-    textY -= 13;
+    textY -= isName ? 22 : isDesignation ? 16 : 13;
   }
 
   return currentY - headerHeight - 14;
@@ -845,7 +829,9 @@ export async function convertDocumentModelToPdf(
 
             const allCellRuns: DocxTextRun[] = [];
             for (const p of cell.blocks) {
-              allCellRuns.push(...p.runs);
+              if (p.type === "paragraph") {
+                allCellRuns.push(...p.runs);
+              }
             }
 
             const cellTokens = tokenizeParagraphRuns(
@@ -875,7 +861,14 @@ export async function convertDocumentModelToPdf(
             }
             if (cCurLine.length > 0) cLines.push(cCurLine);
 
-            const cellEstimatedH = Math.max(1, cLines.length) * 11.5 + cellPadding * 2;
+            const cellImageBlocks = (cell.blocks || []).filter((b) => b.type === "image") as DocxImageBlock[];
+            const cellImageHeight = cellImageBlocks.length > 0
+              ? Math.max(...cellImageBlocks.map((img) => (img.height || 50) + cellPadding * 2))
+              : 0;
+            const cellEstimatedH = Math.max(
+              Math.max(1, cLines.length) * 11.5 + cellPadding * 2,
+              cellImageHeight + cellPadding * 2
+            );
             if (cellEstimatedH > maxRowHeight) maxRowHeight = cellEstimatedH;
 
             cellTokenLines.push({ cell, lines: cLines, width: cellWidth, colStart: colCursor });
@@ -905,6 +898,36 @@ export async function convertDocumentModelToPdf(
               borderColor: PDFLib.rgb(0.85, 0.88, 0.92),
               borderWidth: 0.5,
             });
+
+            const cellImages = (item.cell.blocks || []).filter((block: DocxBlock) => block.type === "image") as DocxImageBlock[];
+            if (cellImages.length > 0) {
+              const cellInnerWidth = item.width - cellPadding * 2;
+              const imageTopY = currentY - maxRowHeight + cellPadding;
+              let imageCursorX = currentCellX + cellPadding;
+              for (const imgBlock of cellImages) {
+                try {
+                  const embeddedImg = await safelyEmbedImageInPdf(pdfDoc, imgBlock.data, imgBlock.mimeType);
+                  let imgW = imgBlock.width || 60;
+                  let imgH = imgBlock.height || 60;
+                  const maxAllowedW = Math.max(24, cellInnerWidth * 0.8);
+                  const scale = Math.min(1, maxAllowedW / imgW, (maxRowHeight - cellPadding * 3) / Math.max(1, imgH));
+                  imgW *= scale;
+                  imgH *= scale;
+
+                  const drawX = Math.min(imageCursorX, currentCellX + item.width - cellPadding - imgW);
+                  const drawY = imageTopY + (maxRowHeight - cellPadding * 2 - imgH) / 2;
+                  currentPage.drawImage(embeddedImg, {
+                    x: drawX,
+                    y: drawY,
+                    width: imgW,
+                    height: imgH,
+                  });
+                  imageCursorX += imgW + 6;
+                } catch (imgErr) {
+                  console.warn("PDF table image draw warning:", imgErr);
+                }
+              }
+            }
 
             // Draw cell text tokens
             for (let lIdx = 0; lIdx < item.lines.length; lIdx++) {
@@ -945,6 +968,19 @@ export async function convertDocumentModelToPdf(
 
           let imgW = imgBlock.width || 120;
           let imgH = imgBlock.height || 120;
+          if (imgW > 0 && imgH > 0) {
+            const aspectRatio = imgW / imgH;
+            const maxSingleDimension = 420;
+            if (imgW > maxSingleDimension || imgH > maxSingleDimension) {
+              if (aspectRatio >= 1) {
+                imgW = maxSingleDimension;
+                imgH = Math.max(10, maxSingleDimension / aspectRatio);
+              } else {
+                imgH = maxSingleDimension;
+                imgW = Math.max(10, maxSingleDimension * aspectRatio);
+              }
+            }
+          }
 
           /*
            * ABSOLUTE POSITIONED IMAGE
@@ -985,7 +1021,7 @@ export async function convertDocumentModelToPdf(
           if (imgW > currentContentWidth) {
             const scale = currentContentWidth / imgW;
             imgW = currentContentWidth;
-            imgH = imgH * scale;
+            imgH = Math.max(10, imgH * scale);
           }
 
           checkPageBreak(imgH + 20);
