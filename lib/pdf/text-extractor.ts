@@ -647,7 +647,11 @@ function buildSpatialLine(
   const headingLevel = isMajorHeading ? (avgFontSize >= 20 ? 1 : 2) : isSectionHeading ? 2 : 3;
 
   // List detection (bullet or numbered)
-  const isListItem = /^[•*–—\u2022\u25cf\u25cb\u25aa]\s+|^\d+[\.\)]\s+|^\[[ x]\]\s+/i.test(cleanText);
+  const isListItem =
+    /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]/i.test(cleanText) ||
+    /^\d+[\.\)]\s+/i.test(cleanText) ||
+    /^\[[ x]\]/i.test(cleanText) ||
+    (items.length > 0 && /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]/.test((items[0]?.str || "").trim()));
 
   return {
     y,
@@ -910,6 +914,60 @@ function reconstructPageBlocks(
     // Normal paragraph line
     const { runs, tabs } = buildRunsAndTabsFromItems(items, line.color);
 
+    let nextScanIdx = lineIdx + 1;
+
+    // Merge wrapped continuation lines into a single unified paragraph
+    if (line.isListItem) {
+      while (nextScanIdx < lines.length) {
+        const nextL = lines[nextScanIdx];
+        if (nextL.isHeading || nextL.isListItem) break;
+        const colTest = analyzeLineColumns(nextL);
+        if (colTest.isMultiCol) break;
+
+        const prevLine = lines[nextScanIdx - 1];
+        const step = nextL.topY - prevLine.topY;
+        const normalStep = (prevLine.fontSize || 10) * 1.65;
+        if (step <= normalStep && Math.abs(nextL.fontSize - line.fontSize) <= 1.5) {
+          const nextRuns = buildRunsFromItems(nextL.items, nextL.color);
+          if (nextRuns.length > 0) {
+            const lastRun = runs[runs.length - 1];
+            if (lastRun && !lastRun.text.endsWith(" ") && !nextRuns[0].text.startsWith(" ")) {
+              runs.push({ text: " " });
+            }
+            runs.push(...nextRuns);
+          }
+          nextScanIdx++;
+        } else {
+          break;
+        }
+      }
+    } else if (!line.isHeading) {
+      while (nextScanIdx < lines.length) {
+        const nextL = lines[nextScanIdx];
+        if (nextL.isHeading || nextL.isListItem) break;
+        const colTest = analyzeLineColumns(nextL);
+        if (colTest.isMultiCol) break;
+
+        const prevLine = lines[nextScanIdx - 1];
+        const step = nextL.topY - prevLine.topY;
+        const normalStep = (prevLine.fontSize || 10) * 1.65;
+        const indentDiff = Math.abs((nextL.minX || 0) - (line.minX || 0));
+        if (step <= normalStep && indentDiff <= 28 && Math.abs(nextL.fontSize - line.fontSize) <= 1.5) {
+          const nextRuns = buildRunsFromItems(nextL.items, nextL.color);
+          if (nextRuns.length > 0) {
+            const lastRun = runs[runs.length - 1];
+            if (lastRun && !lastRun.text.endsWith(" ") && !nextRuns[0].text.startsWith(" ")) {
+              runs.push({ text: " " });
+            }
+            runs.push(...nextRuns);
+          }
+          nextScanIdx++;
+        } else {
+          break;
+        }
+      }
+    }
+
     let spacingBefore = 0;
     if (prevBlockTopY !== null) {
       const baselineStep = line.topY - prevBlockTopY;
@@ -924,7 +982,7 @@ function reconstructPageBlocks(
       spacingBefore = Math.max(spacingBefore, line.headingLevel === 1 ? 8 : 4);
     }
 
-    const spacingAfter = line.isHeading ? 1 : 0;
+    const spacingAfter = line.isHeading ? 1 : (line.isListItem ? 2 : 0);
 
     // Detect bottom border divider line (specifically for headings with a section line underneath)
     let bottomBorder: DocxParagraphBorders["bottom"] | undefined = undefined;
@@ -981,7 +1039,7 @@ function reconstructPageBlocks(
     const fallbackColor = line.color && line.color !== "000000" ? line.color.replace("#", "").toUpperCase() : undefined;
 
     const calcLeftIndent = line.isListItem
-      ? (line.leftIndent && line.leftIndent > 25 ? Math.max(36, line.leftIndent + 14) : 18)
+      ? (line.minX >= leftMargin + 18 ? 32 : 18)
       : (line.alignment === "left" && line.leftIndent !== undefined && line.leftIndent > 3 ? line.leftIndent : undefined);
     const calcHangingIndent = line.isListItem ? 14 : undefined;
 
@@ -1017,9 +1075,9 @@ function reconstructPageBlocks(
       },
     });
 
-    prevBlockTopY = line.topY;
-    prevBlockFontSize = line.fontSize || 10;
-    lineIdx++;
+    prevBlockTopY = lines[nextScanIdx - 1].topY;
+    prevBlockFontSize = lines[nextScanIdx - 1].fontSize || 10;
+    lineIdx = nextScanIdx;
   }
 
   // Add extracted images with their topY positions
