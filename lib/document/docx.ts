@@ -12,6 +12,7 @@
 
 export interface DocxTextRun {
   text: string;
+  tab?: boolean;
   fontFamily?: string;
   fontSize?: number; // in points (pt)
   bold?: boolean;
@@ -28,6 +29,7 @@ export interface DocxParagraphBlock {
   type: "paragraph";
   runs: DocxTextRun[];
   alignment?: "left" | "center" | "right" | "justify";
+  tabs?: { val: "left" | "center" | "right"; pos: number }[];
   isHeading?: boolean;
   headingLevel?: number; // 1, 2, 3...
   isListItem?: boolean;
@@ -139,17 +141,23 @@ export function coalesceRuns(runs: DocxTextRun[]): DocxTextRun[] {
   const result: DocxTextRun[] = [];
 
   for (const r of runs) {
-    if (!r || !r.text) continue;
+    if (!r) continue;
+    if (r.tab) {
+      result.push({ ...r });
+      continue;
+    }
+    if (!r.text) continue;
     const prev = result[result.length - 1];
     if (
       prev &&
+      !prev.tab &&
       (prev.bold || false) === (r.bold || false) &&
       (prev.italic || false) === (r.italic || false) &&
       (prev.underline || false) === (r.underline || false) &&
       (prev.strike || false) === (r.strike || false) &&
       (prev.superscript || false) === (r.superscript || false) &&
       (prev.subscript || false) === (r.subscript || false) &&
-      Math.abs((prev.fontSize || 11) - (r.fontSize || 11)) <= 0.5 &&
+      Math.abs((prev.fontSize || 11) - (r.fontSize || 11)) <= 0.25 &&
       (prev.color || "") === (r.color || "") &&
       (prev.fontFamily || "Calibri") === (r.fontFamily || "Calibri") &&
       (prev.highlight || "") === (r.highlight || "")
@@ -1275,21 +1283,18 @@ export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> 
 // ==========================================
 
 function buildRunXml(r: DocxTextRun): string {
-  const rPrParts: string[] = [];
-
-  // ECMA-376 Standard rPr Child Order:
-  // 1. rFonts
-  if (r.fontFamily) {
-    const fam = escapeXml(r.fontFamily);
-    rPrParts.push(`<w:rFonts w:ascii="${fam}" w:hAnsi="${fam}" w:cs="${fam}"/>`);
+  if (r.tab) {
+    return `<w:r><w:tab/></w:r>`;
   }
 
-  // 2. b / i / strike
-  if (r.bold) rPrParts.push("<w:b/>");
-  if (r.italic) rPrParts.push("<w:i/>");
+  const rPrParts: string[] = [];
+  const fam = escapeXml(r.fontFamily || "Calibri");
+  rPrParts.push(`<w:rFonts w:ascii="${fam}" w:hAnsi="${fam}" w:eastAsia="${fam}" w:cs="${fam}"/>`);
+
+  if (r.bold) rPrParts.push("<w:b/><w:bCs/>");
+  if (r.italic) rPrParts.push("<w:i/><w:iCs/>");
   if (r.strike) rPrParts.push("<w:strike/>");
 
-  // 3. color
   if (r.color) {
     const cleanHex = r.color.replace("#", "").toUpperCase().trim();
     if (cleanHex && cleanHex.length === 6) {
@@ -1297,23 +1302,17 @@ function buildRunXml(r: DocxTextRun): string {
     }
   }
 
-  // 4. sz (in half-points)
-  if (r.fontSize && r.fontSize > 0) {
-    const szVal = Math.round(r.fontSize * 2);
-    rPrParts.push(`<w:sz w:val="${szVal}"/><w:szCs w:val="${szVal}"/>`);
-  }
+  const szVal = Math.round((r.fontSize && r.fontSize > 0 ? r.fontSize : 11) * 2);
+  rPrParts.push(`<w:sz w:val="${szVal}"/><w:szCs w:val="${szVal}"/>`);
 
-  // 5. highlight
   if (r.highlight) {
     rPrParts.push(`<w:highlight w:val="${escapeXml(r.highlight)}"/>`);
   }
 
-  // 6. u (underline)
   if (r.underline) {
     rPrParts.push('<w:u w:val="single"/>');
   }
 
-  // 7. vertAlign (subscript / superscript)
   if (r.superscript) {
     rPrParts.push('<w:vertAlign w:val="superscript"/>');
   } else if (r.subscript) {
@@ -1349,27 +1348,35 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
   }
 
   // 3. jc (alignment)
-  if (block.alignment && block.alignment !== "left") {
+  if (block.alignment) {
     const jc = block.alignment === "justify" ? "both" : block.alignment;
     pPrElements.push(`<w:jc w:val="${jc}"/>`);
   }
 
-  // 4. spacing (in twips: 1pt = 20 twips)
+  // 4. tabs
+  if (block.tabs && block.tabs.length > 0) {
+    const tabXml = block.tabs
+      .map((t) => `<w:tab w:val="${t.val}" w:pos="${Math.round(t.pos * 20)}"/>`)
+      .join("");
+    pPrElements.push(`<w:tabs>${tabXml}</w:tabs>`);
+  }
+
+  // 5. spacing (in twips: 1pt = 20 twips)
   const before = block.spacingBefore !== undefined ? Math.round(block.spacingBefore * 20) : (block.isHeading ? 200 : 0);
-  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 100 : 60);
+  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 80 : 0);
   let spAttrs = `w:before="${before}" w:after="${after}"`;
   if (block.lineSpacing && block.lineSpacing > 0) {
-    spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="exact"`;
+    spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="auto"`;
   }
   pPrElements.push(`<w:spacing ${spAttrs}/>`);
 
-  // 5. ind (indentation)
+  // 6. ind (indentation)
   const indParts: string[] = [];
-  if (block.leftIndent !== undefined) indParts.push(`w:left="${Math.round(block.leftIndent * 20)}"`);
-  if (block.rightIndent !== undefined) indParts.push(`w:right="${Math.round(block.rightIndent * 20)}"`);
-  if (block.firstLineIndent !== undefined) indParts.push(`w:firstLine="${Math.round(block.firstLineIndent * 20)}"`);
-  if (block.hangingIndent !== undefined) indParts.push(`w:hanging="${Math.round(block.hangingIndent * 20)}"`);
-  else if (block.isListItem && block.leftIndent === undefined) indParts.push('w:left="720" w:hanging="360"');
+  if (block.leftIndent !== undefined && block.leftIndent > 0) indParts.push(`w:left="${Math.round(block.leftIndent * 20)}"`);
+  if (block.rightIndent !== undefined && block.rightIndent > 0) indParts.push(`w:right="${Math.round(block.rightIndent * 20)}"`);
+  if (block.firstLineIndent !== undefined && block.firstLineIndent > 0) indParts.push(`w:firstLine="${Math.round(block.firstLineIndent * 20)}"`);
+  if (block.hangingIndent !== undefined && block.hangingIndent > 0) indParts.push(`w:hanging="${Math.round(block.hangingIndent * 20)}"`);
+  else if (block.isListItem && (!block.leftIndent || block.leftIndent === 0)) indParts.push('w:left="720" w:hanging="360"');
   if (indParts.length > 0) pPrElements.push(`<w:ind ${indParts.join(" ")}/>`);
 
   const pPr = pPrElements.length > 0 ? `<w:pPr>${pPrElements.join("")}</w:pPr>` : "";
@@ -1391,15 +1398,20 @@ function buildImageDrawingXml(
   let ptWidth = img.width || 200;
   let ptHeight = img.height || 150;
 
-  if (ptWidth > maxAvailableWidth) {
-    const scale = maxAvailableWidth / ptWidth;
-    ptWidth = maxAvailableWidth;
-    ptHeight = Math.max(10, ptHeight * scale);
-  }
-  if (ptHeight > maxAvailableHeight) {
-    const scale = maxAvailableHeight / ptHeight;
-    ptHeight = maxAvailableHeight;
-    ptWidth = Math.max(10, ptWidth * scale);
+  const isAbsolute = img.position === "absolute" && img.x !== undefined && img.y !== undefined;
+
+  // Only constrain inline images to body margins
+  if (!isAbsolute) {
+    if (ptWidth > maxAvailableWidth) {
+      const scale = maxAvailableWidth / ptWidth;
+      ptWidth = maxAvailableWidth;
+      ptHeight = Math.max(10, ptHeight * scale);
+    }
+    if (ptHeight > maxAvailableHeight) {
+      const scale = maxAvailableHeight / ptHeight;
+      ptHeight = maxAvailableHeight;
+      ptWidth = Math.max(10, ptWidth * scale);
+    }
   }
 
   const emuWidth = Math.round(ptWidth * 12700);
@@ -1422,8 +1434,6 @@ function buildImageDrawingXml(
       <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
     </pic:spPr>
   </pic:pic>`;
-
-  const isAbsolute = img.position === "absolute" && img.x !== undefined && img.y !== undefined;
 
   if (isAbsolute) {
     const posX = Math.round((img.x || 0) * 12700);
@@ -1473,7 +1483,7 @@ function buildImageDrawingXml(
 
 /**
  * Synchronize live edited text with DocumentModel without destroying sections,
- * page dimensions, margins, tables, or embedded images.
+ * page dimensions, spatial coordinates, indents, tabs, margins, or embedded images.
  */
 export function applyEditedTextToDocumentModel(
   originalModel: DocumentModel,
@@ -1483,37 +1493,76 @@ export function applyEditedTextToDocumentModel(
     return parseMarkdownToDocumentModel(editedText);
   }
 
-  const parsedModel = parseMarkdownToDocumentModel(editedText, originalModel.title);
+  const editedLines = (editedText || "").split(/\r?\n/).filter((l) => l.trim().length > 0);
 
-  const allOriginalImages: DocxImageBlock[] = [];
-  for (const sec of originalModel.sections) {
-    for (const b of sec.blocks || []) {
-      if (b.type === "image") allOriginalImages.push(b);
+  // Deep copy sections to preserve spatial layout and embedded images
+  const newSections: DocxSection[] = originalModel.sections.map((sec) => ({
+    pageSize: { ...sec.pageSize },
+    margins: { ...sec.margins },
+    orientation: sec.orientation,
+    blocks: sec.blocks.map((b) => {
+      if (b.type === "image") return { ...b };
+      if (b.type === "table") return { ...b };
+      return {
+        ...b,
+        runs: (b.runs || []).map((r) => ({ ...r })),
+      };
+    }),
+  }));
+
+  // Extract all paragraph blocks to update text in place
+  const paragraphBlocks: DocxParagraphBlock[] = [];
+  for (const sec of newSections) {
+    for (const b of sec.blocks) {
+      if (b.type === "paragraph") {
+        paragraphBlocks.push(b);
+      }
     }
   }
 
-  const newSections: DocxSection[] = (parsedModel.sections || []).map((sec, idx) => {
-    const origSec = originalModel.sections[idx] || originalModel.sections[0];
-    return {
-      pageSize: origSec.pageSize || { width: 595.28, height: 841.89 },
-      margins: origSec.margins || { top: 54, right: 54, bottom: 54, left: 54 },
-      orientation: origSec.orientation,
-      blocks: [...sec.blocks],
-    };
-  });
+  // Update text inside existing spatial paragraph blocks sequentially
+  for (let i = 0; i < Math.min(paragraphBlocks.length, editedLines.length); i++) {
+    const block = paragraphBlocks[i];
+    let rawLine = editedLines[i];
 
-  if (newSections.length === 0) {
-    newSections.push({
-      pageSize: originalModel.sections[0].pageSize || { width: 595.28, height: 841.89 },
-      margins: originalModel.sections[0].margins || { top: 54, right: 54, bottom: 54, left: 54 },
-      orientation: originalModel.sections[0].orientation,
-      blocks: [],
-    });
+    if (rawLine.startsWith("# ") || rawLine.startsWith("## ")) {
+      block.isHeading = true;
+      block.headingLevel = 1;
+      rawLine = rawLine.replace(/^#+\s*/, "");
+    } else if (rawLine.startsWith("### ") || rawLine.startsWith("#### ")) {
+      block.isHeading = true;
+      block.headingLevel = 2;
+      rawLine = rawLine.replace(/^#+\s*/, "");
+    } else if (/^[-*•]\s+/.test(rawLine)) {
+      block.isListItem = true;
+      rawLine = rawLine.replace(/^[-*•]\s+/, "");
+    }
+
+    if (block.runs && block.runs.length > 0) {
+      const baseRun = block.runs.find((r) => !r.tab && r.text) || block.runs[0];
+      block.runs = [
+        {
+          ...baseRun,
+          text: rawLine,
+        },
+      ];
+    } else {
+      block.runs = [{ text: rawLine, fontFamily: "Calibri", fontSize: 11 }];
+    }
   }
 
-  const hasImages = newSections.some((s) => s.blocks.some((b) => b.type === "image"));
-  if (!hasImages && allOriginalImages.length > 0) {
-    newSections[0].blocks.push(...allOriginalImages);
+  // If user typed more lines than original blocks, append new paragraphs to last section
+  if (editedLines.length > paragraphBlocks.length) {
+    const lastSec = newSections[newSections.length - 1];
+    for (let i = paragraphBlocks.length; i < editedLines.length; i++) {
+      const rawLine = editedLines[i];
+      lastSec.blocks.push({
+        type: "paragraph",
+        runs: [{ text: rawLine, fontFamily: "Calibri", fontSize: 11 }],
+        spacingBefore: 2,
+        spacingAfter: 4,
+      });
+    }
   }
 
   return {
@@ -1574,6 +1623,15 @@ export function generateRealDocxBlob(
   <w:font w:name="Garamond"><w:panose1 w:val="02020404030301010803"/><w:family w:val="roman"/><w:pitch w:val="variable"/></w:font>
   <w:font w:name="Consolas"><w:panose1 w:val="020B0609020204030204"/><w:family w:val="modern"/><w:pitch w:val="fixed"/></w:font>
   <w:font w:name="Courier New"><w:panose1 w:val="02070309020205020404"/><w:family w:val="modern"/><w:pitch w:val="fixed"/></w:font>
+  <w:font w:name="Roboto"><w:panose1 w:val="02000500000000000000"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Open Sans"><w:panose1 w:val="020B0606030504040204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Lato"><w:panose1 w:val="020F0502020204030204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Montserrat"><w:panose1 w:val="020B0604020202020204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Poppins"><w:panose1 w:val="020B0604020202020204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Tahoma"><w:panose1 w:val="020B0604030504040204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Century Gothic"><w:panose1 w:val="020B0502020202020204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Franklin Gothic Medium"><w:panose1 w:val="020B0603020102020204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
+  <w:font w:name="Aptos"><w:panose1 w:val="020F0502020204030204"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>
 </w:fonts>`;
 
   const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -1590,28 +1648,28 @@ export function generateRealDocxBlob(
   </w:docDefaults>
   <w:style w:type="paragraph" w:styleId="Normal" w:default="1">
     <w:name w:val="Normal"/>
-    <w:pPr><w:spacing w:after="120" w:line="260" w:lineRule="auto"/></w:pPr>
-    <w:rPr><w:sz w:val="22"/><w:color w:val="1E293B"/></w:rPr>
+    <w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:color w:val="000000"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading1">
     <w:name w:val="heading 1"/>
-    <w:pPr><w:spacing w:before="260" w:after="120"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="32"/><w:szCs w:val="32"/><w:color w:val="0F172A"/></w:rPr>
+    <w:pPr><w:spacing w:before="240" w:after="60"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="32"/><w:szCs w:val="32"/><w:color w:val="000000"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading2">
     <w:name w:val="heading 2"/>
-    <w:pPr><w:spacing w:before="200" w:after="100"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="26"/><w:szCs w:val="26"/><w:color w:val="1E293B"/></w:rPr>
+    <w:pPr><w:spacing w:before="180" w:after="40"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="26"/><w:szCs w:val="26"/><w:color w:val="000000"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading3">
     <w:name w:val="heading 3"/>
-    <w:pPr><w:spacing w:before="140" w:after="80"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="22"/><w:szCs w:val="22"/><w:color w:val="334155"/></w:rPr>
+    <w:pPr><w:spacing w:before="120" w:after="30"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:b/><w:sz w:val="22"/><w:szCs w:val="22"/><w:color w:val="000000"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="ListBullet">
     <w:name w:val="List Bullet"/>
-    <w:pPr><w:ind w:left="720" w:hanging="360"/><w:spacing w:after="80" w:line="240" w:lineRule="auto"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/><w:color w:val="1E293B"/></w:rPr>
+    <w:pPr><w:ind w:left="720" w:hanging="360"/><w:spacing w:after="20" w:line="240" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:color w:val="000000"/></w:rPr>
   </w:style>
   <w:style w:type="table" w:styleId="TableGrid">
     <w:name w:val="Table Grid"/>
