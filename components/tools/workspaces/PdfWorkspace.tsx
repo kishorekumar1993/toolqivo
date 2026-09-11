@@ -53,6 +53,12 @@ import {
   generateRealXlsxBlob,
   protectPdfBuffer,
   unlockPdfBuffer,
+  PdfEngineError,
+  InvalidPdfError,
+  PasswordRequiredError,
+  IncorrectPasswordError,
+  FileTooLargeError,
+  PageLimitExceededError,
 } from "@/lib/pdf-engine";
 
 interface PdfWorkspaceProps {
@@ -1004,10 +1010,14 @@ export function PdfWorkspace({ tool }: PdfWorkspaceProps) {
       console.error("PDF operation failed:", err);
       setIsProcessing(false);
       setDownloadReady(false);
-      setErrorMessage(
-        err?.message ||
-          "Failed to process your PDF documents. Please make sure the files are valid and not password-protected, then try again."
-      );
+      if (err instanceof PdfEngineError || err?.userMessage) {
+        setErrorMessage(err.userMessage || err.message);
+      } else {
+        setErrorMessage(
+          err?.message ||
+            "Failed to process your PDF documents. Please make sure the files are valid and not password-protected, then try again."
+        );
+      }
     }
   };
 
