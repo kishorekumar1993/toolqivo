@@ -460,86 +460,15 @@ function clusterTextItemsIntoLines(
 
   const pageMinX = Math.min(...rawItems.map((it) => it.x));
 
-  // Multi-Column / Sidebar Detection:
-  // Check if body items cleanly divide into 2 distinct columns with a clear vertical gutter
-  let sortedItems: PdfTextItem[] = [];
+  // Standard natural reading order: top-to-bottom, left-to-right (no global page column split)
+  rawItems.sort((a, b) => {
+    const dy = b.y - a.y;
+    if (Math.abs(dy) > 3.0) return dy;
+    return a.x - b.x;
+  });
+  const sortedItems = rawItems;
 
-  // Find potential vertical split gutter between 25% and 65% of viewport width
-  let bestSplitX = -1;
-  let minCrossingItems = Infinity;
-
-  for (let splitCandidate = Math.round(viewportWidth * 0.25); splitCandidate <= Math.round(viewportWidth * 0.65); splitCandidate += 15) {
-    let leftCount = 0;
-    let rightCount = 0;
-    let crossingCount = 0;
-
-    for (const it of rawItems) {
-      const itRight = it.x + it.width;
-      if (itRight <= splitCandidate + 6) {
-        leftCount++;
-      } else if (it.x >= splitCandidate - 6) {
-        rightCount++;
-      } else {
-        crossingCount++;
-      }
-    }
-
-    if (leftCount >= 6 && rightCount >= 6 && crossingCount < minCrossingItems) {
-      minCrossingItems = crossingCount;
-      bestSplitX = splitCandidate;
-    }
-  }
-
-  const isMultiColumnPage =
-    bestSplitX > 0 &&
-    minCrossingItems <= Math.max(3, rawItems.length * 0.08);
-
-  if (isMultiColumnPage) {
-    const headerItems: PdfTextItem[] = [];
-    const leftColItems: PdfTextItem[] = [];
-    const rightColItems: PdfTextItem[] = [];
-    const footerItems: PdfTextItem[] = [];
-
-    // Header threshold: items in top 15% of page that span wide
-    for (const it of rawItems) {
-      const itRight = it.x + it.width;
-      const isWide = it.width >= viewportWidth * 0.45;
-      const isTopZone = it.topY < viewportHeight * 0.16;
-
-      if ((isTopZone && isWide) || (it.topY < 90 && isWide)) {
-        headerItems.push(it);
-      } else if (it.topY > viewportHeight * 0.90 && isWide) {
-        footerItems.push(it);
-      } else if (itRight <= bestSplitX + 8) {
-        leftColItems.push(it);
-      } else {
-        rightColItems.push(it);
-      }
-    }
-
-    const sortTopDown = (a: PdfTextItem, b: PdfTextItem) => {
-      const dy = b.y - a.y;
-      if (Math.abs(dy) > 3.0) return dy;
-      return a.x - b.x;
-    };
-
-    headerItems.sort(sortTopDown);
-    leftColItems.sort(sortTopDown);
-    rightColItems.sort(sortTopDown);
-    footerItems.sort(sortTopDown);
-
-    sortedItems = [...headerItems, ...leftColItems, ...rightColItems, ...footerItems];
-  } else {
-    // Single column: standard top-to-bottom, left-to-right reading order
-    rawItems.sort((a, b) => {
-      const dy = b.y - a.y;
-      if (Math.abs(dy) > 3.0) return dy;
-      return a.x - b.x;
-    });
-    sortedItems = rawItems;
-  }
-
-  const lines: PdfSpatialLine[] = [];
+  const rawLines: PdfSpatialLine[] = [];
   let currentGroup: PdfTextItem[] = [];
   let currentY: number | null = null;
 
@@ -553,14 +482,21 @@ function clusterTextItemsIntoLines(
       const yDiff = Math.abs(item.y - currentY);
 
       // Relative line clustering tolerance based on font size
-      const tolerance = Math.max(1.5, Math.min(5.5, avgGroupFontSize * 0.28));
-      const isSameLine = yDiff <= tolerance && (fontSizeDiff <= 4.5 || yDiff <= 1.5);
+      const tolerance = Math.max(1.2, Math.min(3.5, avgGroupFontSize * 0.22));
+
+      // Items that overlap horizontally using true bounding boxes or start a new bullet belong to a new spatial line
+      const lastItem = currentGroup[currentGroup.length - 1];
+      const lastItemRight = lastItem.x + lastItem.width;
+      const overlapsHorizontally = item.x < lastItemRight - 0.5 && (item.x + item.width) > lastItem.x + 0.5;
+      const isNewBullet = /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]/.test(item.str.trim());
+
+      const isSameLine = !overlapsHorizontally && !isNewBullet && yDiff <= tolerance && (fontSizeDiff <= 3.5 || yDiff <= 1.2);
 
       if (isSameLine) {
         currentGroup.push(item);
       } else {
         currentGroup.sort((a, b) => a.x - b.x);
-        lines.push(buildSpatialLine(currentGroup, currentY, pageMinX, viewportWidth, viewportHeight));
+        rawLines.push(buildSpatialLine(currentGroup, currentY, pageMinX, viewportWidth, viewportHeight));
         currentY = item.y;
         currentGroup = [item];
       }
@@ -569,10 +505,94 @@ function clusterTextItemsIntoLines(
 
   if (currentGroup.length > 0 && currentY !== null) {
     currentGroup.sort((a, b) => a.x - b.x);
-    lines.push(buildSpatialLine(currentGroup, currentY, pageMinX, viewportWidth, viewportHeight));
+    rawLines.push(buildSpatialLine(currentGroup, currentY, pageMinX, viewportWidth, viewportHeight));
   }
 
+  // Normalize spatial lines: merge standalone bullets and dates before block reconstruction
+  const lines = normalizeSpatialLines(rawLines);
+
   return { lines, pageMinX };
+}
+
+/**
+ * Normalizes physical lines before block reconstruction:
+ * 1. Attaches standalone bullet markers to their subsequent text line
+ * 2. Merges date fragments (e.g. "Oct 2025" and "• Aug 2026 | Chennai") into a unified date line without list classification
+ */
+function normalizeSpatialLines(rawLines: PdfSpatialLine[]): PdfSpatialLine[] {
+  const result: PdfSpatialLine[] = [];
+  let i = 0;
+
+  while (i < rawLines.length) {
+    const cur = rawLines[i];
+    const curText = cur.text.trim();
+
+    // Check if cur is a standalone bullet only
+    const isStandaloneBulletOnly = /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]$/.test(curText);
+
+    if (isStandaloneBulletOnly && i + 1 < rawLines.length) {
+      const nextLine = rawLines[i + 1];
+      const dy = nextLine.topY - cur.topY;
+      if (dy >= 0 && dy <= Math.max(nextLine.fontSize, 10) * 2.5) {
+        const bulletItem = cur.items[0] || {
+          str: curText,
+          x: cur.minX,
+          y: cur.y,
+          topY: cur.topY,
+          width: 8,
+          height: cur.fontSize,
+          fontSize: cur.fontSize,
+          fontName: "",
+          fontFamily: cur.fontFamily,
+          isBold: cur.isBold,
+          isItalic: cur.isItalic,
+          isUnderline: cur.isUnderline,
+          color: cur.color,
+        };
+
+        nextLine.items = [bulletItem, ...nextLine.items];
+        nextLine.minX = Math.min(cur.minX, nextLine.minX);
+        nextLine.text = `${curText} ${nextLine.text}`.trim();
+        nextLine.isListItem = true;
+        i++;
+        continue;
+      }
+    }
+
+    // Check date fragment merging: e.g. "Oct 2025" followed by "• Aug 2026 | Chennai, India" or "- Aug 2026"
+    const isStartDate = /^(?:[•·●–—\-]\s*)?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$/i.test(curText);
+    if (isStartDate && i + 1 < rawLines.length) {
+      const nextLine = rawLines[i + 1];
+      const nextText = nextLine.text.trim();
+      const isEndDate = /^(?:[•·●–—\-]\s*)?(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|Present)/i.test(nextText);
+      const dy = nextLine.topY - cur.topY;
+
+      if (isEndDate && dy >= 0 && dy <= Math.max(cur.fontSize, 10) * 2.5) {
+        const cleanStart = curText.replace(/^[•·●–—\-]\s*/, "");
+        const cleanEnd = nextText.replace(/^[•·●–—\-]\s*/, "");
+        const mergedText = `${cleanStart} – ${cleanEnd}`;
+
+        nextLine.items = [...cur.items, ...nextLine.items];
+        nextLine.text = mergedText;
+        nextLine.minX = Math.min(cur.minX, nextLine.minX);
+        nextLine.maxX = Math.max(cur.maxX, nextLine.maxX);
+        nextLine.isListItem = false;
+        i++;
+        continue;
+      }
+    }
+
+    // Check if line is a date range line starting with a bullet marker
+    if (/^[•·●]\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/i.test(curText) && (curText.includes("|") || curText.includes("–") || curText.includes("-"))) {
+      cur.isListItem = false;
+      cur.text = cur.text.replace(/^[•·●]\s*/, "");
+    }
+
+    result.push(cur);
+    i++;
+  }
+
+  return result;
 }
 
 function buildSpatialLine(
@@ -594,7 +614,8 @@ function buildSpatialLine(
 
     if (lastX >= 0) {
       const gap = item.x - (lastX + lastWidth);
-      if (gap >= 1.8 && !item.str.startsWith(" ") && !lineText.endsWith(" ")) {
+      const spaceThreshold = Math.max(0.75, Math.min(3.5, (item.fontSize || 10) * 0.12));
+      if (gap >= spaceThreshold && !item.str.startsWith(" ") && !lineText.endsWith(" ")) {
         lineText += " ";
       }
     }
@@ -617,34 +638,7 @@ function buildSpatialLine(
   const pageCenter = viewportWidth / 2;
   const lineWidth = safeMaxX - safeMinX;
 
-  const leftMargin = Math.max(28, Math.min(54, Math.round(pageMinX)));
-
-  // Alignment detection
-  let alignment: "left" | "center" | "right" | "justify" = "left";
-  let leftIndent: number | undefined = undefined;
-
-  const isFullWidth = lineWidth >= (viewportWidth - leftMargin * 2 - 20);
-
-  if (!isFullWidth) {
-    if (Math.abs(centerX - pageCenter) <= 24 && safeMinX >= 35 && safeMaxX <= viewportWidth - 35) {
-      alignment = "center";
-    } else if (safeMaxX >= viewportWidth - 60 && safeMinX >= viewportWidth * 0.45) {
-      alignment = "right";
-    } else if (safeMinX > leftMargin + 4) {
-      leftIndent = Math.round(safeMinX - leftMargin);
-    }
-  }
-
-  // Heading & Subheading classification
-  const isShortLine = cleanText.length < 80;
-  const isAllUpper = /^[A-Z0-9\s&/,\-–—|:]{3,70}$/.test(cleanText) && !cleanText.includes("@") && !cleanText.includes(".com");
-  const isMajorHeading = avgFontSize >= 16;
-  const isSectionHeading = (avgFontSize >= 12.5 && isBold && isShortLine) || (isAllUpper && (isBold || avgFontSize >= 11.5) && isShortLine);
-  const hasAccentColor = Boolean(color && color !== "000000" && color !== "111827" && color !== "333333");
-  const isSubheading = (avgFontSize >= 10.5 && isBold && isShortLine) || (hasAccentColor && (isBold || avgFontSize >= 10.5) && isShortLine);
-
-  const isHeading = isMajorHeading || isSectionHeading || isSubheading;
-  const headingLevel = isMajorHeading ? (avgFontSize >= 20 ? 1 : 2) : isSectionHeading ? 2 : 3;
+  const leftMargin = Number.isFinite(pageMinX) && pageMinX > 0 ? Math.max(0, Math.round(pageMinX)) : 54;
 
   // List detection (bullet or numbered)
   const isListItem =
@@ -652,6 +646,44 @@ function buildSpatialLine(
     /^\d+[\.\)]\s+/i.test(cleanText) ||
     /^\[[ x]\]/i.test(cleanText) ||
     (items.length > 0 && /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]/.test((items[0]?.str || "").trim()));
+
+  // Alignment detection: NEVER center continuation body lines or list items
+  let alignment: "left" | "center" | "right" | "justify" = "left";
+  let leftIndent: number | undefined = undefined;
+
+  const isFullWidth = lineWidth >= (viewportWidth - leftMargin * 2 - 20);
+
+  if (!isFullWidth && !isListItem) {
+    const leftSpace = safeMinX - leftMargin;
+    const rightSpace = viewportWidth - leftMargin - safeMaxX;
+    const isSymmetric = Math.abs(leftSpace - rightSpace) <= 20;
+
+    if (isSymmetric && leftSpace >= 45 && rightSpace >= 45 && Math.abs(centerX - pageCenter) <= 15) {
+      alignment = "center";
+    } else if (safeMaxX >= viewportWidth - 55 && safeMinX >= viewportWidth * 0.5) {
+      alignment = "right";
+    } else if (safeMinX > leftMargin + 6) {
+      leftIndent = Math.round(safeMinX - leftMargin);
+    }
+  }
+
+  // Heading & Subheading classification
+  const isShortLine = cleanText.length < 90;
+  const isAllUpper = /^[A-Z0-9\s&/,\-–—|:]{3,70}$/.test(cleanText) && !cleanText.includes("@") && !cleanText.includes(".com");
+  const isMajorHeading = avgFontSize >= 15;
+  const isSectionHeading = (avgFontSize >= 12.0 && isBold && isShortLine) || (isAllUpper && (isBold || avgFontSize >= 11.0) && isShortLine);
+  const hasAccentColor = Boolean(color && color !== "000000" && color !== "111827" && color !== "333333");
+
+  // Robust Project Subheading detection (e.g. "CRM & Financial Systems (Insurance Domain – Flutter Web):", "Beema Insurance Platform (B2C & B2B Website | Insurance / FinTech):")
+  const isProjectTitle = (isBold && isShortLine && (cleanText.endsWith(":") || cleanText.includes("(") || cleanText.includes("|") || cleanText.includes("–") || cleanText.includes("-"))) || (cleanText.endsWith(":") && isShortLine);
+  const isSubheading = !isListItem && (
+    (avgFontSize >= 10.5 && isBold && isShortLine) ||
+    (hasAccentColor && (isBold || avgFontSize >= 10.5) && isShortLine) ||
+    isProjectTitle
+  );
+
+  const isHeading = !isListItem && (isMajorHeading || isSectionHeading || isSubheading);
+  const headingLevel = isMajorHeading ? (avgFontSize >= 18 ? 1 : 2) : isSectionHeading ? 2 : 3;
 
   return {
     y,
@@ -696,11 +728,13 @@ function analyzeLineColumns(line: PdfSpatialLine): {
     return { isMultiCol: false, leftItems: items, rightItems: [], splitX: 0 };
   }
 
+  const minColumnGap = Math.max(14, (line.fontSize || 10) * 1.4);
+
   for (let i = 0; i < items.length - 1; i++) {
     const itA = items[i];
     const itB = items[i + 1];
     const gap = itB.x - (itA.x + itA.width);
-    if (gap >= 18.0 && itA.x < 240 && itB.x >= 120) {
+    if (gap >= minColumnGap && itA.width > 0 && itB.width > 0) {
       const leftItems = items.slice(0, i + 1);
       const rightItems = items.slice(i + 1);
       return {
@@ -782,10 +816,11 @@ function buildRunsAndTabsFromItems(
     }
     if (lastX >= 0) {
       const gap = it.x - (lastX + lastW);
+      const spaceThreshold = Math.max(0.75, Math.min(3.5, (it.fontSize || 10) * 0.12));
       if (gap >= 18.0 && it.x > 70) {
         runs.push({ text: "\t", tab: true });
         tabs.push({ val: "left", pos: it.x });
-      } else if (gap >= 1.5 && !str.startsWith(" ") && (runs.length === 0 || !runs[runs.length - 1].text.endsWith(" "))) {
+      } else if (gap >= spaceThreshold && !str.startsWith(" ") && (runs.length === 0 || !runs[runs.length - 1].text.endsWith(" "))) {
         str = " " + str;
       }
     }
@@ -827,7 +862,7 @@ function reconstructPageBlocks(
   filledBoxes: PdfFilledBox[] = []
 ): DocxBlock[] {
   const elements: PageVisualElement[] = [];
-  const leftMargin = Math.max(28, Math.min(54, Math.round(pageMinX)));
+  const leftMargin = Number.isFinite(pageMinX) && pageMinX > 0 ? Math.max(0, Math.round(pageMinX)) : 54;
   const availableWidth = viewportWidth - leftMargin * 2;
 
   let lineIdx = 0;
@@ -843,71 +878,169 @@ function reconstructPageBlocks(
       continue;
     }
 
-    // Check if line and subsequent lines form a multi-row 2-column key-value or skills section (require >= 2 rows)
+    // Check if line and subsequent lines form a multi-row 2-column key-value or skills table
     const colInfo = analyzeLineColumns(line);
-    if (colInfo.isMultiCol && !line.isHeading) {
-      const tableRows: DocxTableRow[] = [];
-      const tableTopY = line.topY;
-      const splitX = colInfo.splitX;
-      const leftColWidth = Math.max(60, Math.min(220, Math.round(splitX - leftMargin)));
-      const rightColWidth = Math.max(100, Math.round(availableWidth - leftColWidth));
+    if (!line.isHeading && colInfo.isMultiCol) {
+      // Lookahead scan to verify multi-row column pattern and determine stable splitX
+      const candidateSplits: number[] = [];
+      let testIdx = lineIdx;
 
-      let scanIdx = lineIdx;
-      while (scanIdx < lines.length) {
-        const curLine = lines[scanIdx];
-        if (curLine.isHeading) break;
+      while (testIdx < lines.length) {
+        const testLine = lines[testIdx];
+        if (testLine.isHeading && (!testLine.headingLevel || testLine.headingLevel <= 2)) break;
 
-        const curColInfo = analyzeLineColumns(curLine);
-        if (curColInfo.isMultiCol && Math.abs(curColInfo.splitX - splitX) <= 35) {
-          const lRuns = buildRunsFromItems(curColInfo.leftItems, curLine.color);
-          const rRuns = buildRunsFromItems(curColInfo.rightItems, curLine.color);
-          tableRows.push({
-            cells: [
-              {
-                width: leftColWidth,
-                blocks: [{ type: "paragraph", runs: lRuns.length > 0 ? lRuns : [{ text: "" }], alignment: "left" }],
-              },
-              {
-                width: rightColWidth,
-                blocks: [{ type: "paragraph", runs: rRuns.length > 0 ? rRuns : [{ text: "" }], alignment: "left" }],
-              },
-            ],
-          });
-          scanIdx++;
-        } else if (curLine.minX >= splitX - 25 && curLine.maxX > splitX + 30 && tableRows.length > 0) {
-          const rRuns = buildRunsFromItems(curLine.items, curLine.color);
-          tableRows.push({
-            cells: [
-              {
-                width: leftColWidth,
-                blocks: [{ type: "paragraph", runs: [{ text: "" }], alignment: "left" }],
-              },
-              {
-                width: rightColWidth,
-                blocks: [{ type: "paragraph", runs: rRuns.length > 0 ? rRuns : [{ text: curLine.text }], alignment: "left" }],
-              },
-            ],
-          });
-          scanIdx++;
-        } else {
-          break;
+        const testCol = analyzeLineColumns(testLine);
+        if (testCol.isMultiCol) {
+          candidateSplits.push(testCol.splitX);
+        } else if (testLine.minX >= leftMargin + 40 && testLine.minX <= viewportWidth * 0.65) {
+          candidateSplits.push(testLine.minX);
         }
+
+        if (testIdx > lineIdx) {
+          const dy = testLine.topY - lines[testIdx - 1].topY;
+          if (dy > (testLine.fontSize || 10) * 3.0) break;
+        }
+        testIdx++;
       }
 
-      // Only create table if 2 or more rows matched the column grid. Otherwise, process as single line with tabs.
-      if (tableRows.length >= 2) {
-        elements.push({
-          topY: tableTopY,
-          block: {
-            type: "table",
-            borderStyle: "none",
-            colWidths: [leftColWidth, rightColWidth],
-            rows: tableRows,
-          },
-        });
-        prevBlockTopY = tableTopY;
-        lineIdx = scanIdx;
-        continue;
+      if (candidateSplits.length >= 2) {
+        candidateSplits.sort((a, b) => a - b);
+        const stableSplitX = candidateSplits[Math.floor(candidateSplits.length / 2)];
+
+        const leftColWidth = Math.max(30, Math.round(stableSplitX - leftMargin));
+        const rightColWidth = Math.max(30, Math.round(availableWidth - leftColWidth));
+
+        const tableRows: DocxTableRow[] = [];
+        const tableTopY = line.topY;
+        let scanIdx = lineIdx;
+
+        while (scanIdx < lines.length) {
+          const curLine = lines[scanIdx];
+
+          // Stop condition 1: genuine section heading
+          if (curLine.isHeading && (!curLine.headingLevel || curLine.headingLevel <= 2)) {
+            break;
+          }
+
+          // Stop condition 2: wide line that spans across the whole page without a column split
+          const curCol = analyzeLineColumns(curLine);
+          const spansWholePageWithoutSplit =
+            curLine.minX <= leftMargin + 10 &&
+            curLine.maxX >= viewportWidth - leftMargin - 40 &&
+            !curCol.isMultiCol;
+
+          if (spansWholePageWithoutSplit && tableRows.length >= 1) {
+            break;
+          }
+
+          // Stop condition 3: large vertical gap
+          if (scanIdx > lineIdx) {
+            const dy = curLine.topY - lines[scanIdx - 1].topY;
+            if (dy > (curLine.fontSize || 10) * 2.6) {
+              break;
+            }
+          }
+
+          // Strictly classify items relative to stableSplitX without overlapping margin
+          const leftItems: PdfTextItem[] = [];
+          const rightItems: PdfTextItem[] = [];
+          for (const it of curLine.items) {
+            const midX = it.x + it.width / 2;
+            if (midX < stableSplitX) {
+              leftItems.push(it);
+            } else {
+              rightItems.push(it);
+            }
+          }
+
+          const hasBothCols = leftItems.length > 0 && rightItems.length > 0;
+          const isLeftOnly = leftItems.length > 0 && rightItems.length === 0;
+          const isRightOnly = rightItems.length > 0 && leftItems.length === 0;
+
+          if (hasBothCols || (curCol.isMultiCol && Math.abs(curCol.splitX - stableSplitX) <= 40)) {
+            // NEW LOGICAL TABLE ROW
+            const actualLeftItems = hasBothCols ? leftItems : curCol.leftItems;
+            const actualRightItems = hasBothCols ? rightItems : curCol.rightItems;
+
+            const lRuns = buildRunsFromItems(actualLeftItems, curLine.color);
+            const rRuns = buildRunsFromItems(actualRightItems, curLine.color);
+
+            tableRows.push({
+              cells: [
+                {
+                  width: leftColWidth,
+                  blocks: [{ type: "paragraph", runs: lRuns.length > 0 ? lRuns : [{ text: "" }], alignment: "left" }],
+                },
+                {
+                  width: rightColWidth,
+                  blocks: [{ type: "paragraph", runs: rRuns.length > 0 ? rRuns : [{ text: "" }], alignment: "left" }],
+                },
+              ],
+            });
+            scanIdx++;
+          } else if (isRightOnly && tableRows.length > 0) {
+            // MERGE INTO RIGHT CELL OF PREVIOUS ROW (DO NOT CREATE NEW ROW)
+            const previousRow = tableRows[tableRows.length - 1];
+            const rightCell = previousRow.cells[1];
+            const para = rightCell.blocks.find((b) => b.type === "paragraph") as DocxParagraphBlock;
+
+            const rRuns = buildRunsFromItems(rightItems.length > 0 ? rightItems : curLine.items, curLine.color);
+            if (para && rRuns.length > 0) {
+              const firstStr = (curLine.items[0]?.str || "").trim();
+              const startsWithBullet = /^[•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]/.test(firstStr);
+
+              const lastRun = para.runs[para.runs.length - 1];
+              if (startsWithBullet) {
+                if (lastRun && !lastRun.text.endsWith("\n") && !lastRun.text.endsWith(" ")) {
+                  para.runs.push({ text: "\n" });
+                }
+              } else {
+                if (lastRun && !lastRun.text.endsWith(" ") && !lastRun.text.endsWith("\n") && !rRuns[0].text.startsWith(" ")) {
+                  para.runs.push({ text: " " });
+                }
+              }
+              para.runs.push(...rRuns);
+            }
+            scanIdx++;
+          } else if (isLeftOnly && tableRows.length > 0) {
+            // MERGE INTO LEFT CELL OF PREVIOUS ROW (CONTINUATION OF LEFT LABEL)
+            const previousRow = tableRows[tableRows.length - 1];
+            const leftCell = previousRow.cells[0];
+            const para = leftCell.blocks.find((b) => b.type === "paragraph") as DocxParagraphBlock;
+
+            const lRuns = buildRunsFromItems(leftItems.length > 0 ? leftItems : curLine.items, curLine.color);
+            if (para && lRuns.length > 0) {
+              const lastRun = para.runs[para.runs.length - 1];
+              if (lastRun && !lastRun.text.endsWith(" ") && !lastRun.text.endsWith("\n") && !lRuns[0].text.startsWith(" ")) {
+                para.runs.push({ text: " " });
+              }
+              para.runs.push(...lRuns);
+            }
+            scanIdx++;
+          } else {
+            if (tableRows.length >= 2) {
+              break;
+            } else {
+              scanIdx++;
+            }
+          }
+        }
+
+        // Only create table if 2 or more logical rows matched the column grid
+        if (tableRows.length >= 2) {
+          elements.push({
+            topY: tableTopY,
+            block: {
+              type: "table",
+              borderStyle: "none",
+              colWidths: [leftColWidth, rightColWidth],
+              rows: tableRows,
+            },
+          });
+          prevBlockTopY = tableTopY;
+          lineIdx = scanIdx;
+          continue;
+        }
       }
     }
 
@@ -921,12 +1054,16 @@ function reconstructPageBlocks(
       while (nextScanIdx < lines.length) {
         const nextL = lines[nextScanIdx];
         if (nextL.isHeading || nextL.isListItem) break;
+        if (nextL.isBold && !line.isBold) break;
+        if (nextL.text.endsWith(":") && nextL.text.length < 90) break;
+        if (nextL.minX < line.minX - 4) break;
+
         const colTest = analyzeLineColumns(nextL);
         if (colTest.isMultiCol) break;
 
         const prevLine = lines[nextScanIdx - 1];
         const step = nextL.topY - prevLine.topY;
-        const normalStep = (prevLine.fontSize || 10) * 1.65;
+        const normalStep = (prevLine.fontSize || 10) * 1.85;
         if (step <= normalStep && Math.abs(nextL.fontSize - line.fontSize) <= 1.5) {
           const nextRuns = buildRunsFromItems(nextL.items, nextL.color);
           if (nextRuns.length > 0) {
@@ -945,14 +1082,17 @@ function reconstructPageBlocks(
       while (nextScanIdx < lines.length) {
         const nextL = lines[nextScanIdx];
         if (nextL.isHeading || nextL.isListItem) break;
+        if (nextL.isBold && !line.isBold) break;
+        if (nextL.text.endsWith(":") && nextL.text.length < 90) break;
+
         const colTest = analyzeLineColumns(nextL);
         if (colTest.isMultiCol) break;
 
         const prevLine = lines[nextScanIdx - 1];
         const step = nextL.topY - prevLine.topY;
-        const normalStep = (prevLine.fontSize || 10) * 1.65;
+        const normalStep = (prevLine.fontSize || 10) * 1.85;
         const indentDiff = Math.abs((nextL.minX || 0) - (line.minX || 0));
-        if (step <= normalStep && indentDiff <= 28 && Math.abs(nextL.fontSize - line.fontSize) <= 1.5) {
+        if (step <= normalStep && indentDiff <= 32 && Math.abs(nextL.fontSize - line.fontSize) <= 1.5) {
           const nextRuns = buildRunsFromItems(nextL.items, nextL.color);
           if (nextRuns.length > 0) {
             const lastRun = runs[runs.length - 1];
@@ -972,17 +1112,23 @@ function reconstructPageBlocks(
     if (prevBlockTopY !== null) {
       const baselineStep = line.topY - prevBlockTopY;
       const normalStep = prevBlockFontSize * 1.30;
-      if (baselineStep > normalStep * 1.55) {
+      if (baselineStep > normalStep * 1.6) {
         const extraGap = baselineStep - normalStep;
-        spacingBefore = Math.min(14, Math.max(2, Math.round(extraGap * 0.70)));
+        spacingBefore = Math.min(6, Math.max(1, Math.round(extraGap * 0.40)));
       }
     }
 
     if (line.isHeading) {
-      spacingBefore = Math.max(spacingBefore, line.headingLevel === 1 ? 8 : 4);
+      if (line.headingLevel === 1) {
+        spacingBefore = Math.max(spacingBefore, 6);
+      } else if (line.headingLevel === 2) {
+        spacingBefore = Math.max(spacingBefore, 4);
+      } else {
+        spacingBefore = Math.max(spacingBefore, 2);
+      }
     }
 
-    const spacingAfter = line.isHeading ? 1 : (line.isListItem ? 2 : 0);
+    const spacingAfter = line.isHeading ? (line.headingLevel === 1 ? 2 : 1) : 0;
 
     // Detect bottom border divider line (specifically for headings with a section line underneath)
     let bottomBorder: DocxParagraphBorders["bottom"] | undefined = undefined;
@@ -1038,10 +1184,26 @@ function reconstructPageBlocks(
 
     const fallbackColor = line.color && line.color !== "000000" ? line.color.replace("#", "").toUpperCase() : undefined;
 
-    const calcLeftIndent = line.isListItem
-      ? (line.minX >= leftMargin + 18 ? 32 : 18)
-      : (line.alignment === "left" && line.leftIndent !== undefined && line.leftIndent > 3 ? line.leftIndent : undefined);
-    const calcHangingIndent = line.isListItem ? 14 : undefined;
+    // Derive list indentation from actual geometry coordinates
+    let calcLeftIndent: number | undefined = undefined;
+    let calcHangingIndent: number | undefined = undefined;
+
+    if (line.isListItem) {
+      const bulletX = line.minX;
+      const firstTextItem = items.length > 1 ? items[1] : items[0];
+      const textX = firstTextItem && firstTextItem.x > bulletX ? firstTextItem.x : bulletX + 14;
+      calcLeftIndent = Math.max(0, Math.round(textX - leftMargin));
+      calcHangingIndent = Math.max(8, Math.round(textX - bulletX));
+    } else if (line.alignment === "left" && line.leftIndent !== undefined && line.leftIndent > 4) {
+      calcLeftIndent = line.leftIndent;
+    }
+
+    const blockTabs = [...tabs];
+    if (line.isListItem && calcLeftIndent) {
+      if (!blockTabs.some((t) => Math.abs(t.pos - calcLeftIndent!) <= 2)) {
+        blockTabs.unshift({ val: "left", pos: calcLeftIndent });
+      }
+    }
 
     elements.push({
       topY: line.topY,
@@ -1064,7 +1226,7 @@ function reconstructPageBlocks(
         alignment: line.alignment,
         leftIndent: calcLeftIndent,
         hangingIndent: calcHangingIndent,
-        tabs: tabs.length > 0 ? tabs : undefined,
+        tabs: blockTabs.length > 0 ? blockTabs : undefined,
         isHeading: line.isHeading,
         headingLevel: line.headingLevel,
         isListItem: line.isListItem,
@@ -1726,10 +1888,11 @@ export async function extractRealPdfContent(buffer: ArrayBuffer): Promise<Extrac
           maxTopY = Math.max(maxTopY, itTopY + ih);
         }
 
-        const leftMargin = Number.isFinite(minX) && minX >= 28 ? Math.max(36, Math.min(54, Math.round(minX))) : 54;
-        const rightMargin = Number.isFinite(maxX) && (viewport.width - maxX) >= 28 ? Math.max(36, Math.min(54, Math.round(viewport.width - maxX))) : 54;
-        const topMargin = Number.isFinite(minTopY) && minTopY >= 28 ? Math.max(36, Math.min(54, Math.round(minTopY))) : 54;
-        const bottomMargin = Number.isFinite(maxTopY) && (viewport.height - maxTopY) >= 28 ? Math.max(36, Math.min(54, Math.round(viewport.height - maxTopY))) : 54;
+        const defaultMargin = 54;
+        const leftMargin = Number.isFinite(minX) && minX > 0 ? Math.max(14, Math.round(minX)) : defaultMargin;
+        const rightMargin = Number.isFinite(maxX) && maxX < viewport.width ? Math.max(14, Math.round(viewport.width - maxX)) : defaultMargin;
+        const topMargin = Number.isFinite(minTopY) && minTopY > 0 ? Math.max(14, Math.round(minTopY)) : defaultMargin;
+        const bottomMargin = Number.isFinite(maxTopY) && maxTopY < viewport.height ? Math.max(14, Math.round(viewport.height - maxTopY)) : defaultMargin;
 
         pageSections.push({
           pageSize: { width: viewport.width || 595.28, height: viewport.height || 841.89 },

@@ -350,114 +350,7 @@ function findImagesInBlocks(blocks: any[]): DocxImageBlock[] {
   return images;
 }
 
-/**
- * Render a CV-style header table with profile photo on left and text on right.
- * Returns the new currentY after rendering.
- */
-async function renderHeaderTable(
-  tbl: DocxTableBlock,
-  pdfDoc: any,
-  currentPage: any,
-  fonts: { regular: any; bold: any; italic: any; boldItalic: any },
-  PDFLib: any,
-  marginLeft: number,
-  currentY: number,
-  contentWidth: number
-): Promise<number> {
-  if (!tbl.rows?.length) return currentY;
 
-  const firstRow = tbl.rows[0];
-  if (!firstRow.cells?.length) return currentY;
-
-  const allImages = findImagesInBlocks(
-    firstRow.cells.flatMap((cell: any) => cell.blocks || [])
-  );
-
-  if (allImages.length === 0) return currentY;
-
-  /*
-   * This is the resume header:
-   * ┌──────────┬─────────────────────────────┐
-   * │   PHOTO  │ Name                        │
-   * │          │ Designation                 │
-   * │          │ Contact                     │
-   * └──────────┴─────────────────────────────┘
-   */
-
-  const image = allImages[0];
-  let imageWidth = image.width || 75;
-  let imageHeight = image.height || 100;
-  const maxImageWidth = 85;
-  const maxImageHeight = 85;
-  const scale = Math.min(maxImageWidth / imageWidth, maxImageHeight / imageHeight, 1);
-  imageWidth *= scale;
-  imageHeight *= scale;
-
-  const headerHeight = Math.max(90, imageHeight + 20);
-
-  // Header background
-  currentPage.drawRectangle({
-    x: marginLeft,
-    y: currentY - headerHeight,
-    width: contentWidth,
-    height: headerHeight,
-    color: PDFLib.rgb(0.94, 0.96, 0.98),
-  });
-
-  // Draw profile image
-  try {
-    const embeddedImage = await safelyEmbedImageInPdf(pdfDoc, image.data, image.mimeType);
-    const imageX = marginLeft + 12;
-    const imageY = currentY - 10 - imageHeight;
-    currentPage.drawImage(embeddedImage, {
-      x: imageX,
-      y: imageY,
-      width: imageWidth,
-      height: imageHeight,
-    });
-  } catch (e) {
-    console.warn("Header profile image render failed:", e);
-  }
-
-  // Text starts after the photo, using the actual paragraph ordering from the header table.
-  const textX = marginLeft + 120;
-  let textY = currentY - 22;
-
-  const headerParagraphs: Array<{ text: string; alignment?: "left" | "center" | "right" | "justify"; isPrimary?: boolean }> = [];
-  for (const cell of firstRow.cells) {
-    if (cell.blocks.some((block) => block.type === "image")) continue;
-    for (const block of cell.blocks || []) {
-      if (block.type !== "paragraph") continue;
-      const paragraphText = ((block as DocxParagraphBlock).runs || [])
-        .map((r: any) => r.text || "")
-        .join("")
-        .trim();
-      if (paragraphText) {
-        headerParagraphs.push({
-          text: paragraphText,
-          alignment: (block as DocxParagraphBlock).alignment || "left",
-          isPrimary: headerParagraphs.length === 0,
-        });
-      }
-    }
-  }
-
-  for (let i = 0; i < headerParagraphs.length; i++) {
-    const paragraph = headerParagraphs[i];
-    const isName = i === 0;
-    const isDesignation = i === 1;
-    safeDrawText(currentPage, sanitizeTextForPdf(paragraph.text), {
-      x: textX + (paragraph.alignment === "right" ? 110 : 0),
-      y: textY,
-      size: isName ? 18 : isDesignation ? 11 : 8.5,
-      font: isName || isDesignation ? fonts.bold : fonts.regular,
-      color: isName ? PDFLib.rgb(0.05, 0.25, 0.40) : isDesignation ? PDFLib.rgb(0.10, 0.45, 0.70) : PDFLib.rgb(0.12, 0.16, 0.23),
-    });
-    textY -= isName ? 22 : isDesignation ? 16 : 13;
-  }
-
-  return currentY - headerHeight - 14;
-}
 
 /**
  * Render a high-fidelity DocumentModel into a multi-page PDF document
@@ -534,10 +427,10 @@ export async function convertDocumentModelToPdf(
     const section = model.sections[sIdx];
     currentSecPageWidth = section.pageSize?.width || 595.28;
     currentSecPageHeight = section.pageSize?.height || 841.89;
-    currentMarginTop = Math.max(30, section.margins?.top || 54);
-    currentMarginRight = Math.max(30, section.margins?.right || 54);
-    currentMarginBottom = Math.max(30, section.margins?.bottom || 54);
-    currentMarginLeft = Math.max(30, section.margins?.left || 54);
+    currentMarginTop = section.margins?.top !== undefined ? Math.max(0, section.margins.top) : 54;
+    currentMarginRight = section.margins?.right !== undefined ? Math.max(0, section.margins.right) : 54;
+    currentMarginBottom = section.margins?.bottom !== undefined ? Math.max(0, section.margins.bottom) : 54;
+    currentMarginLeft = section.margins?.left !== undefined ? Math.max(0, section.margins.left) : 54;
     currentContentWidth = currentSecPageWidth - currentMarginLeft - currentMarginRight;
 
     // Start section on a new page (or initial page)
@@ -560,57 +453,84 @@ export async function convertDocumentModelToPdf(
         const beforeSpace = para.spacingBefore !== undefined ? para.spacingBefore : (isHeading ? 10 : 2);
         const afterSpace = para.spacingAfter !== undefined ? para.spacingAfter : (isHeading ? 6 : 4);
 
+        // Keep-with-next for Headings: measure actual next block to prevent orphaned headings
+        if (isHeading) {
+          const nextBlock = section.blocks[section.blocks.indexOf(block) + 1];
+          let nextBlockHeight = 24;
+          if (nextBlock && nextBlock.type === "paragraph") {
+            const nextP = nextBlock as DocxParagraphBlock;
+            const nextRuns = nextP.runs || [];
+            const nextFontSize = nextRuns[0]?.fontSize || 10;
+            nextBlockHeight = Math.max(16, nextFontSize * 1.4 + (nextP.spacingBefore || 0) + (nextP.spacingAfter || 0));
+          } else if (nextBlock && nextBlock.type === "table") {
+            nextBlockHeight = 32;
+          }
+          const requiredHeight = beforeSpace + defaultFontSize * 1.5 + afterSpace + nextBlockHeight;
+          if (currentY - requiredHeight < currentMarginBottom) {
+            addNewPage();
+          }
+        }
+
         currentY -= beforeSpace;
 
-        const baseLeftIndent = (para.leftIndent || 0) + (isListItem ? 16 : 0);
+        const leftIndent = isListItem
+          ? (para.leftIndent && para.leftIndent > 0 ? para.leftIndent : 20)
+          : (para.leftIndent || 0);
         const rightIndent = para.rightIndent || 0;
-        const firstLineIndent = para.firstLineIndent || 0;
-        const hangingIndent = para.hangingIndent || 0;
+        const firstLineIndent = isListItem ? 0 : (para.firstLineIndent || 0);
+        const hangingIndent = isListItem
+          ? (para.hangingIndent && para.hangingIndent > 0 ? para.hangingIndent : 14)
+          : (para.hangingIndent || 0);
 
-        /*
-         * Reserve left column for header photo.
-         * Typical CV profile photo: x ≈ 20-80, width ≈ 90-130
-         * Text starts after the photo.
-         */
-        let effectiveBaseLeftIndent = baseLeftIndent;
-
-        const hasLeftHeaderImage = section.blocks.some(
-          (b) =>
-            b.type === "image" &&
-            (b as DocxImageBlock).position === "absolute" &&
-            ((b as DocxImageBlock).x ?? 999) < currentMarginLeft + 120 &&
-            ((b as DocxImageBlock).y ?? 999) < 180
-        );
-
-        if (
-          hasLeftHeaderImage &&
-          currentY > currentSecPageHeight - currentMarginTop - 180
-        ) {
-          effectiveBaseLeftIndent = Math.max(
-            effectiveBaseLeftIndent,
-            125
-          );
-        }
+        let effectiveBaseLeftIndent = leftIndent;
 
         const maxTextWidth = Math.max(
           60,
           currentContentWidth - effectiveBaseLeftIndent - rightIndent
         );
 
-        // Draw bullet point marker if list item
-        if (isListItem) {
-          safeDrawText(currentPage, "*", {
-            x: currentMarginLeft + (para.leftIndent || 0) + 4,
-            y: currentY - defaultFontSize,
-            size: defaultFontSize,
-            font: fontSet.sans.bold,
-            color: PDFLib.rgb(0.05, 0.58, 0.53),
-          });
+        // If list item, determine bullet marker and strip leading bullet/tabs from runs so it's not double-drawn
+        let bulletMarker = para.bulletChar || "•";
+        let effectiveRuns: DocxTextRun[] = para.runs ? [...para.runs] : [];
+        let bulletColor = PDFLib.rgb(0.12, 0.16, 0.23);
+
+        if (isListItem && effectiveRuns.length > 0) {
+          const firstNonTabIdx = effectiveRuns.findIndex((r) => !r.tab && r.text);
+          if (firstNonTabIdx >= 0) {
+            const firstRun = effectiveRuns[firstNonTabIdx];
+            if (firstRun.color) {
+              bulletColor = parseHexColor(PDFLib, firstRun.color, { r: 0.12, g: 0.16, b: 0.23 });
+            }
+            const matchBullet = firstRun.text.match(/^([•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]|\d+[\.\)])\s*/);
+            if (matchBullet) {
+              bulletMarker = matchBullet[1];
+              const remainder = firstRun.text.slice(matchBullet[0].length);
+              const cleanedRuns: DocxTextRun[] = [];
+              for (let i = 0; i < firstNonTabIdx; i++) cleanedRuns.push(effectiveRuns[i]);
+              if (remainder) {
+                cleanedRuns.push({ ...firstRun, text: remainder });
+              }
+              for (let i = firstNonTabIdx + 1; i < effectiveRuns.length; i++) {
+                if (i === firstNonTabIdx + 1 && effectiveRuns[i].tab) continue;
+                cleanedRuns.push(effectiveRuns[i]);
+              }
+              effectiveRuns = cleanedRuns;
+            }
+          }
         }
 
         // Tokenize paragraph runs into inline words and spaces (with long-word protection)
-        const tokens = tokenizeParagraphRuns(para.runs, fontSet, defaultFontSize, isHeading, PDFLib, maxTextWidth);
+        const tokens = tokenizeParagraphRuns(effectiveRuns, fontSet, defaultFontSize, isHeading, PDFLib, maxTextWidth);
         if (tokens.length === 0) {
+          if (isListItem) {
+            safeDrawText(currentPage, bulletMarker, {
+              x: currentMarginLeft + effectiveBaseLeftIndent - hangingIndent,
+              y: currentY - defaultFontSize,
+              size: defaultFontSize,
+              font: fontSet.sans.regular,
+              color: bulletColor,
+            });
+          }
           currentY -= afterSpace;
           continue;
         }
@@ -640,7 +560,7 @@ export async function convertDocumentModelToPdf(
           }
 
           const isFirstLine = lines.length === 0;
-          const currentLineIndent = isFirstLine ? firstLineIndent : hangingIndent;
+          const currentLineIndent = isFirstLine ? firstLineIndent : 0;
           const targetLineWidth = Math.max(50, maxTextWidth - currentLineIndent);
 
           if (curLineWidth + token.width <= targetLineWidth || curLineTokens.length === 0) {
@@ -687,7 +607,20 @@ export async function convertDocumentModelToPdf(
 
           checkPageBreak(lineHeight);
 
-          const lineIndentOffset = isFirstLine ? firstLineIndent : hangingIndent;
+          // Draw bullet marker on the first line of the list item
+          if (isListItem && isFirstLine) {
+            const bulletX = currentMarginLeft + effectiveBaseLeftIndent - hangingIndent;
+            const bulletY = currentY - line.maxFontSize;
+            safeDrawText(currentPage, bulletMarker, {
+              x: bulletX,
+              y: bulletY,
+              size: line.maxFontSize,
+              font: fontSet.sans.regular,
+              color: bulletColor,
+            });
+          }
+
+          const lineIndentOffset = isFirstLine ? firstLineIndent : 0;
           const lineAvailableW = Math.max(50, maxTextWidth - lineIndentOffset);
           const startBaseX = currentMarginLeft + effectiveBaseLeftIndent + lineIndentOffset;
 
@@ -723,35 +656,27 @@ export async function convertDocumentModelToPdf(
                 });
               }
 
-              let drawY = currentY - token.fontSize;
-              if (token.superscript) {
-                drawY += token.fontSize * 0.4;
-              } else if (token.subscript) {
-                drawY -= token.fontSize * 0.15;
-              }
-
+              const textY = currentY - token.fontSize;
               safeDrawText(currentPage, token.text, {
                 x: curX,
-                y: drawY,
+                y: textY,
                 size: token.fontSize,
                 font: token.font,
                 color: token.color,
               });
 
-              // Underline drawing
               if (token.underline) {
-                const uY = currentY - token.fontSize - 1.5;
+                const uY = textY - 1.5;
                 currentPage.drawLine({
                   start: { x: curX, y: uY },
                   end: { x: curX + tokenW, y: uY },
-                  thickness: Math.max(0.6, token.fontSize * 0.055),
+                  thickness: Math.max(0.6, token.fontSize * 0.06),
                   color: token.color,
                 });
               }
 
-              // Strikethrough drawing
               if (token.strike) {
-                const sY = currentY - token.fontSize * 0.52;
+                const sY = textY + token.fontSize * 0.35;
                 currentPage.drawLine({
                   start: { x: curX, y: sY },
                   end: { x: curX + tokenW, y: sY },
@@ -772,31 +697,12 @@ export async function convertDocumentModelToPdf(
         const tbl = block as DocxTableBlock;
         if (tbl.rows.length === 0) continue;
 
-        // Detect header table with embedded image (CV profile photo)
-        const tableImages = findImagesInBlocks(
-          tbl.rows?.[0]?.cells?.flatMap((cell: any) => cell.blocks || []) || []
-        );
 
-        if (tableImages.length > 0 && tableImages[0]?.data) {
-          currentY = await renderHeaderTable(
-            tbl,
-            pdfDoc,
-            currentPage,
-            {
-              regular: fontSet.sans.regular,
-              bold: fontSet.sans.bold,
-              italic: fontSet.sans.italic,
-              boldItalic: fontSet.sans.boldItalic,
-            },
-            PDFLib,
-            currentMarginLeft,
-            currentY,
-            currentContentWidth
-          );
-          continue;
-        }
 
-        currentY -= 6;
+        const spacingBefore = tbl.spacingBefore !== undefined ? tbl.spacingBefore : 4;
+        const spacingAfter = tbl.spacingAfter !== undefined ? tbl.spacingAfter : 6;
+        currentY -= spacingBefore;
+
         const totalCols = Math.max(...tbl.rows.map((r) => r.cells.reduce((acc, c) => acc + (c.colSpan || 1), 0)));
         if (totalCols === 0) continue;
 
@@ -813,11 +719,11 @@ export async function convertDocumentModelToPdf(
 
         for (let rIdx = 0; rIdx < tbl.rows.length; rIdx++) {
           const row = tbl.rows[rIdx];
-          const isHeader = row.isHeader || rIdx === 0;
+          const isHeader = row.isHeader === true;
 
           // Compute cell bounding heights based on tokens
-          let maxRowHeight = 22;
-          const cellTokenLines: { cell: any; lines: any[]; width: number; colStart: number }[] = [];
+          let maxRowHeight = 16;
+          const cellTokenLines: { cell: any; lines: any[]; width: number; colStart: number; fontSize: number; lineHeight: number }[] = [];
 
           let colCursor = 0;
           for (const cell of row.cells) {
@@ -828,16 +734,19 @@ export async function convertDocumentModelToPdf(
             }
 
             const allCellRuns: DocxTextRun[] = [];
-            for (const p of cell.blocks) {
+            for (const p of cell.blocks || []) {
               if (p.type === "paragraph") {
                 allCellRuns.push(...p.runs);
               }
             }
 
+            const cellFontSize = allCellRuns.find((r) => r.fontSize && r.fontSize > 0)?.fontSize || (isHeader ? 9.5 : 8.5);
+            const cellLineHeight = cellFontSize * 1.32;
+
             const cellTokens = tokenizeParagraphRuns(
               allCellRuns,
               fontSet,
-              isHeader ? 9 : 8.5,
+              cellFontSize,
               isHeader,
               PDFLib
             );
@@ -849,6 +758,12 @@ export async function convertDocumentModelToPdf(
             let cCurW = 0;
 
             for (const token of cellTokens) {
+              if (token.isNewline) {
+                cLines.push(cCurLine);
+                cCurLine = [];
+                cCurW = 0;
+                continue;
+              }
               if (cCurLine.length === 0 && token.isSpace) continue;
               if (cCurW + token.width <= maxCellW || cCurLine.length === 0) {
                 cCurLine.push(token);
@@ -861,17 +776,17 @@ export async function convertDocumentModelToPdf(
             }
             if (cCurLine.length > 0) cLines.push(cCurLine);
 
-            const cellImageBlocks = (cell.blocks || []).filter((b) => b.type === "image") as DocxImageBlock[];
+            const cellImageBlocks = (cell.blocks || []).filter((b: DocxBlock) => b.type === "image") as DocxImageBlock[];
             const cellImageHeight = cellImageBlocks.length > 0
               ? Math.max(...cellImageBlocks.map((img) => (img.height || 50) + cellPadding * 2))
               : 0;
             const cellEstimatedH = Math.max(
-              Math.max(1, cLines.length) * 11.5 + cellPadding * 2,
+              Math.max(1, cLines.length) * cellLineHeight + cellPadding * 2,
               cellImageHeight + cellPadding * 2
             );
             if (cellEstimatedH > maxRowHeight) maxRowHeight = cellEstimatedH;
 
-            cellTokenLines.push({ cell, lines: cLines, width: cellWidth, colStart: colCursor });
+            cellTokenLines.push({ cell, lines: cLines, width: cellWidth, colStart: colCursor, fontSize: cellFontSize, lineHeight: cellLineHeight });
             colCursor += span;
           }
 
@@ -879,25 +794,30 @@ export async function convertDocumentModelToPdf(
 
           // Draw cells in row
           let currentCellX = currentMarginLeft;
+          const isBorderless = tbl.borderStyle === "none";
           for (const item of cellTokenLines) {
             const cellBg = item.cell.bgColor
               ? parseHexColor(PDFLib, item.cell.bgColor)
               : isHeader
-              ? PDFLib.rgb(0.94, 0.96, 0.98)
-              : rIdx % 2 === 1
-              ? PDFLib.rgb(0.98, 0.99, 1.0)
-              : PDFLib.rgb(1, 1, 1);
+                ? PDFLib.rgb(0.94, 0.96, 0.98)
+                : isBorderless
+                  ? undefined
+                  : rIdx % 2 === 1
+                    ? PDFLib.rgb(0.98, 0.99, 1.0)
+                    : undefined;
 
-            // Draw cell background
-            currentPage.drawRectangle({
-              x: currentCellX,
-              y: currentY - maxRowHeight,
-              width: item.width,
-              height: maxRowHeight,
-              color: cellBg,
-              borderColor: PDFLib.rgb(0.85, 0.88, 0.92),
-              borderWidth: 0.5,
-            });
+            // Draw cell background and borders only if needed
+            if (cellBg || !isBorderless) {
+              currentPage.drawRectangle({
+                x: currentCellX,
+                y: currentY - maxRowHeight,
+                width: item.width,
+                height: maxRowHeight,
+                color: cellBg,
+                borderColor: isBorderless ? undefined : PDFLib.rgb(0.85, 0.88, 0.92),
+                borderWidth: isBorderless ? 0 : 0.5,
+              });
+            }
 
             const cellImages = (item.cell.blocks || []).filter((block: DocxBlock) => block.type === "image") as DocxImageBlock[];
             if (cellImages.length > 0) {
@@ -933,7 +853,7 @@ export async function convertDocumentModelToPdf(
             for (let lIdx = 0; lIdx < item.lines.length; lIdx++) {
               const cLine = item.lines[lIdx];
               let drawTokenX = currentCellX + cellPadding;
-              const drawTokenY = currentY - cellPadding - 9 - lIdx * 11.5;
+              const drawTokenY = currentY - cellPadding - item.fontSize - lIdx * item.lineHeight;
 
               for (const token of cLine) {
                 if (!token.isSpace) {
@@ -955,7 +875,7 @@ export async function convertDocumentModelToPdf(
           currentY -= maxRowHeight;
         }
 
-        currentY -= 10;
+        currentY -= spacingAfter;
       } else if (block.type === "image") {
         try {
           const imgBlock = block as DocxImageBlock;

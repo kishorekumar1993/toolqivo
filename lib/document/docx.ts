@@ -90,6 +90,8 @@ export interface DocxTableBlock {
   colWidths?: number[]; // in pt
   hasHeader?: boolean;
   borderStyle?: "grid" | "none";
+  spacingBefore?: number;
+  spacingAfter?: number;
 }
 
 export interface DocxImageBlock {
@@ -340,8 +342,9 @@ export function parseMarkdownToDocumentModel(text: string, title?: string): Docu
       blocks.push({
         type: "paragraph",
         isListItem: true,
-        leftIndent: 18,
+        leftIndent: 20,
         hangingIndent: 14,
+        tabs: [{ val: "left", pos: 20 }],
         runs: parseInlineMarkdownRuns(bulletText),
         spacingBefore: 1,
         spacingAfter: 3,
@@ -1144,7 +1147,7 @@ function parseTableXml(
   if (trMatches) {
     for (let rIdx = 0; rIdx < trMatches.length; rIdx++) {
       const trXml = trMatches[rIdx];
-      const isHeader = rIdx === 0 || /<w:tblHeader\/>/i.test(trXml);
+      const isHeader = /<w:tblHeader\b/i.test(trXml);
       const cells: DocxTableCell[] = [];
 
       const tcMatches = trXml.match(/<w:tc\b[\s\S]*?<\/w:tc>/g);
@@ -1344,7 +1347,7 @@ export async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> 
         .replace(/\s+/g, " ")
         .trim();
       if (clean.length > 20) return clean;
-    } catch {}
+    } catch { }
     return "";
   }
 
@@ -1446,9 +1449,9 @@ function buildRunXml(r: DocxTextRun): string {
   const rawText = r.text || "";
   const textContent = rawText.includes("\n")
     ? rawText
-        .split("\n")
-        .map((part: string) => `<w:t xml:space="preserve">${escapeXml(part)}</w:t>`)
-        .join("<w:br/>")
+      .split("\n")
+      .map((part: string) => `<w:t xml:space="preserve">${escapeXml(part)}</w:t>`)
+      .join("<w:br/>")
     : `<w:t xml:space="preserve">${escapeXml(rawText)}</w:t>`;
 
   return `<w:r>${rPr}${textContent}</w:r>`;
@@ -1514,38 +1517,24 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
     }
   }
 
-  // 5. jc (alignment)
-  if (block.alignment) {
-    const jc = block.alignment === "justify" ? "both" : block.alignment;
-    pPrElements.push(`<w:jc w:val="${jc}"/>`);
-  }
+  // ECMA-376 Standard pPr Child Order:
+  // 1. pStyle
+  // 2. pageBreakBefore
+  // 2b. framePr
+  // 3. pBdr
+  // 4. shd
+  // 5. tabs
+  // 6. spacing
+  // 7. ind
+  // 8. jc
 
-  // 6. tabs
-  if (block.tabs && block.tabs.length > 0) {
-    const tabXml = block.tabs
-      .map((t) => `<w:tab w:val="${t.val}" w:pos="${Math.round(t.pos * 20)}"/>`)
-      .join("");
-    pPrElements.push(`<w:tabs>${tabXml}</w:tabs>`);
-  }
-
-  // 7. spacing (in twips: 1pt = 20 twips) - Tight accurate line spacing without ballooning
-  const before = block.spacingBefore !== undefined ? Math.round(block.spacingBefore * 20) : (block.isHeading ? 120 : 0);
-  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 40 : (block.isListItem ? 30 : 0));
-  let spAttrs = `w:before="${before}" w:after="${after}"`;
-  if (block.lineSpacing && block.lineSpacing > 0) {
-    spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="auto"`;
-  } else {
-    spAttrs += ` w:line="240" w:lineRule="auto"`;
-  }
-  pPrElements.push(`<w:spacing ${spAttrs}/>`);
-
-  // 8. ind (indentation and list handling)
+  // 5. tabs (including explicit tab stop for list items to ensure flawless hanging alignment in Word)
   let rawRuns = block.runs || [];
   let leftIndent = block.leftIndent;
   let hangingIndent = block.hangingIndent;
 
   if (block.isListItem) {
-    if (leftIndent === undefined || leftIndent <= 0) leftIndent = 18;
+    if (leftIndent === undefined || leftIndent <= 0) leftIndent = 20;
     if (hangingIndent === undefined || hangingIndent <= 0) hangingIndent = 14;
 
     if (rawRuns.length > 0) {
@@ -1554,7 +1543,7 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
         const firstRun = rawRuns[firstNonTabIdx];
         const matchBullet = firstRun.text.match(/^([•*–—\u2022\u25cf\u25cb\u25aa\u25a0\uF0B7\uF0A7]|\d+[\.\)])\s*/);
         if (matchBullet) {
-          const bulletMarker = matchBullet[1] || "•";
+          const bulletMarker = matchBullet[1] || block.bulletChar || "•";
           const remainder = firstRun.text.slice(matchBullet[0].length);
           const newRuns: DocxTextRun[] = [];
           for (let idx = 0; idx < firstNonTabIdx; idx++) newRuns.push(rawRuns[idx]);
@@ -1570,21 +1559,62 @@ function buildParagraphXml(block: DocxParagraphBlock): string {
           const baseFont = firstRun.fontFamily || "Calibri";
           const baseSz = firstRun.fontSize || 11;
           rawRuns = [
-            { text: "•", fontFamily: baseFont, fontSize: baseSz, color: firstRun.color },
+            { text: block.bulletChar || "•", fontFamily: baseFont, fontSize: baseSz, color: firstRun.color },
             { text: "\t", tab: true },
             ...rawRuns,
           ];
         }
       }
+    } else {
+      rawRuns = [
+        { text: block.bulletChar || "•", fontFamily: "Calibri", fontSize: 11 },
+        { text: "\t", tab: true },
+      ];
     }
   }
 
+  const allTabs: { val: "left" | "center" | "right"; pos: number }[] = [];
+  if (block.tabs && block.tabs.length > 0) {
+    allTabs.push(...block.tabs);
+  }
+  if (block.isListItem && leftIndent !== undefined && leftIndent > 0) {
+    const leftTwips = Math.round(leftIndent * 20);
+    if (!allTabs.some((t) => Math.abs(Math.round(t.pos * 20) - leftTwips) <= 10)) {
+      allTabs.unshift({ val: "left", pos: leftIndent });
+    }
+  }
+
+  if (allTabs.length > 0) {
+    const tabXml = allTabs
+      .map((t) => `<w:tab w:val="${t.val}" w:pos="${Math.round(t.pos * 20)}"/>`)
+      .join("");
+    pPrElements.push(`<w:tabs>${tabXml}</w:tabs>`);
+  }
+
+  // 6. spacing (in twips: 1pt = 20 twips) - Tight accurate line spacing without ballooning
+  const before = block.spacingBefore !== undefined ? Math.round(block.spacingBefore * 20) : (block.isHeading ? 80 : 0);
+  const after = block.spacingAfter !== undefined ? Math.round(block.spacingAfter * 20) : (block.isHeading ? 30 : 0);
+  let spAttrs = `w:before="${before}" w:after="${after}"`;
+  if (block.lineSpacing && block.lineSpacing > 0) {
+    spAttrs += ` w:line="${Math.round(block.lineSpacing * 20)}" w:lineRule="auto"`;
+  } else {
+    spAttrs += ` w:line="240" w:lineRule="auto"`;
+  }
+  pPrElements.push(`<w:spacing ${spAttrs}/>`);
+
+  // 7. ind (indentation and list handling)
   const indParts: string[] = [];
   if (leftIndent !== undefined && leftIndent > 0) indParts.push(`w:left="${Math.round(leftIndent * 20)}"`);
   if (block.rightIndent !== undefined && block.rightIndent > 0) indParts.push(`w:right="${Math.round(block.rightIndent * 20)}"`);
   if (block.firstLineIndent !== undefined && block.firstLineIndent > 0) indParts.push(`w:firstLine="${Math.round(block.firstLineIndent * 20)}"`);
   if (hangingIndent !== undefined && hangingIndent > 0) indParts.push(`w:hanging="${Math.round(hangingIndent * 20)}"`);
   if (indParts.length > 0) pPrElements.push(`<w:ind ${indParts.join(" ")}/>`);
+
+  // 8. jc (alignment)
+  if (block.alignment) {
+    const jc = block.alignment === "justify" ? "both" : block.alignment;
+    pPrElements.push(`<w:jc w:val="${jc}"/>`);
+  }
 
   const pPr = pPrElements.length > 0 ? `<w:pPr>${pPrElements.join("")}</w:pPr>` : "";
   const coalesced = coalesceRuns(rawRuns);
@@ -1744,8 +1774,9 @@ export function applyEditedTextToDocumentModel(
       rawLine = rawLine.replace(/^#+\s*/, "");
     } else if (/^[-*•]\s+/.test(rawLine)) {
       block.isListItem = true;
-      block.leftIndent = block.leftIndent || 18;
+      block.leftIndent = block.leftIndent || 20;
       block.hangingIndent = block.hangingIndent || 14;
+      block.tabs = block.tabs || [{ val: "left", pos: block.leftIndent }];
       rawLine = rawLine.replace(/^[-*•]\s+/, "");
     }
 
@@ -2069,9 +2100,23 @@ export function generateRealDocxBlob(
       }
     }
 
-    // In OpenXML: intermediate sections have their sectPr inside a paragraph at the end of the section
+    // In OpenXML: intermediate sections have their sectPr inside the last paragraph's pPr to prevent creating empty paragraph lines
     if (!isLastSection) {
-      bodyXmlParts.push(`<w:p><w:pPr>${sectPrXml}</w:pPr></w:p>`);
+      if (bodyXmlParts.length > 0) {
+        const lastIdx = bodyXmlParts.length - 1;
+        const lastXml = bodyXmlParts[lastIdx];
+        if (lastXml.startsWith("<w:p>") || lastXml.startsWith("<w:p ")) {
+          if (lastXml.includes("<w:pPr>")) {
+            bodyXmlParts[lastIdx] = lastXml.replace("</w:pPr>", `${sectPrXml}</w:pPr>`);
+          } else {
+            bodyXmlParts[lastIdx] = lastXml.replace("<w:p>", `<w:p><w:pPr>${sectPrXml}</w:pPr>`);
+          }
+        } else {
+          bodyXmlParts.push(`<w:p><w:pPr>${sectPrXml}</w:pPr></w:p>`);
+        }
+      } else {
+        bodyXmlParts.push(`<w:p><w:pPr>${sectPrXml}</w:pPr></w:p>`);
+      }
     }
   }
 
